@@ -1,0 +1,9 @@
+#!/bin/bash
+
+IP = 127.0.0.1:7878
+
+# testing existence of webserver
+curl $IP
+curl $IP --data "Hello, World!" 
+# Result should not work. Only POSTs to whitelisted URLs are accepted
+curl $IP/api/belgrade/documents
