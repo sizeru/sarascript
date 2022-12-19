@@ -331,6 +331,12 @@ fn main() {
                 stream.write(response!("200 OK", "GET REQUEST RECEIVED")).unwrap()
             }
             "POST" => {
+                if let Err(error) = handle_post(&request) {
+                    stream.write(response!("400 Bad Request", error));
+                    stream.flush().unwrap();
+                    continue;
+                }
+                
                 stream.write( response!("200 OK", "POST received")).unwrap()
             }
             _=> stream.write(response!("400 Bad Request", [request.method.as_str(), "is not supported yet"].join(" "))).unwrap() 
@@ -338,4 +344,14 @@ fn main() {
 
         stream.flush().unwrap();
     }
+}
+
+// Handles a POST Http request
+fn handle_post(request: &HttpRequest) -> Result<(), &str> {
+    // According to the README, on a POST to /api/belgrade/documents, the
+    // webserver is supposed to add a document to the database
+    if !request.location.eq("/api/belgrade/documents") {
+        return Err("POSTs can only be made to /api/belgrade/documents");
+    }
+    return Ok(());
 }
