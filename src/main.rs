@@ -121,6 +121,9 @@ impl HttpRequest {
     fn new<'a>(request_as_bytes: &'a[u8], mut stream: &TcpStream) -> Result<HttpRequest, &'a  str> {
         // Request line
         let request_size = request_as_bytes.len();
+        if request_size == 0 {
+            return Err("Http Request received with length 0");
+        }
         let method_end = u8_index_of(request_as_bytes, b' ', 0, request_size).unwrap();
         let method = String::from_utf8_lossy(&request_as_bytes[..method_end]).into_owned();
 
@@ -307,28 +310,31 @@ fn main() {
             stream.write(
                 response!("400 Bad Request", "Http Request is larger than max allowed request (64KB).")
             ).unwrap();
-        } else {
-            match HttpRequest::new(&raw_request[..request_size], &stream) {
-                Err(error) => {
-                    stream.write(response!("400 Bad Request", error)).unwrap();
-                }
-                Ok(request) => {
-                    println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
-                        request.method, request.location, request.version, request.headers, request.body);
+            stream.flush().unwrap();
+            continue;
+        } 
 
-                    // Parse request
-                    match request.method.as_str() {
-                        "GET" => {
-                            stream.write(response!("200 OK", "GET REQUEST RECEIVED")).unwrap()
-                        }
-                        "POST" => {
-                            stream.write( response!("200 OK", "POST received")).unwrap()
-                        }
-                        _=> stream.write(response!("400 Bad Request", [request.method.as_str(), "is not supported yet"].join(" "))).unwrap() 
-                    };   
-                }
+        let request = HttpRequest::new(&raw_request[..request_size], &stream);
+        if let Err(error) = request {
+            stream.write(response!("400 Bad Request", error)).unwrap();
+            stream.flush().unwrap();
+            continue;
+        } 
+                
+        let request = request.unwrap();
+        println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
+            request.method, request.location, request.version, request.headers, request.body);
+
+        // Parse request
+        match request.method.as_str() {
+            "GET" => {
+                stream.write(response!("200 OK", "GET REQUEST RECEIVED")).unwrap()
             }
-        }
+            "POST" => {
+                stream.write( response!("200 OK", "POST received")).unwrap()
+            }
+            _=> stream.write(response!("400 Bad Request", [request.method.as_str(), "is not supported yet"].join(" "))).unwrap() 
+        };
 
         stream.flush().unwrap();
     }
