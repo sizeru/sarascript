@@ -19,3 +19,7 @@ GET | /api/belgrade/batches/{batch_id} | Retrieve a detailed summary of all docu
 POST | /api/belgrade/documents | Add a document to the database | Y
 
 * Note: ?hashes=included can be added to the end of any URI in order
+
+# Function Documentaion
+handle_post:
+Handles a POST Http request. This is where the PDF is received as a stream of bytes. The PDF will then be processed and placed into the appropriate file in the appropriate location with the appropriate metadata.

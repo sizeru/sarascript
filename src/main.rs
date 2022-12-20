@@ -1,6 +1,9 @@
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
+use flate2::bufread::DeflateDecoder;
+use num_digitize::FromDigits;
+
 use crate::Body::{Single, MultiPart};
 
 const KB: usize = 1024;
@@ -10,6 +13,8 @@ const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
 const MAX_REQ: usize = (64 * KB) - 1;
+const CR: &[u8] = &[13 as u8];
+const LF: &[u8] = &[10 as u8];
 
 // NOTE: Receiving multipart/formdata is not currently supported.
 
@@ -43,6 +48,14 @@ enum Body {
     MultiPart(Vec<FormData>) // Struct with headers. Used when receiving multipart data.
 }
 
+// The various types of PDF which are processed
+#[derive(Debug)]
+enum PDFType {
+    BatchWeight,
+    DeliveryTicket,
+    Unknown
+}
+
 // When FormData is recieved in an HTTP request, each FormData contains
 // headers and a body. There may be several of these FormDatas, each of which
 // may contain another nested formdata entry. This is the recursive struct which defines
@@ -60,6 +73,15 @@ struct HttpRequest {
     version: String,
     headers: HashMap<String, String>,
     body: Body // Body is typically stored as a raw byte array
+}
+
+// Stores PDF metadata
+#[derive(Debug)]
+struct PDFMetadata {
+    version: String,
+    pdf_type: PDFType,
+    date: String, // could easily store this as a different datatype to save space
+    customer: String,
 }
 
 // Formats an HTTP response to an array of bytes.
@@ -102,6 +124,15 @@ fn u8_index_of_multi(array: &[u8], predicate: &[u8], start_index: usize, end_ind
     }
 }
 
+impl Body {
+    fn single(&self) -> Result<&Vec<u8>, &str> {
+        if let Single(body) = self {
+            return Ok(body);
+        } else {
+            return Err("Could not convert Body struct to byte array");
+        }
+    }
+}
 
 impl HttpRequest {
     // Returns a new HttpRequest struct from a well formatted HttpRequest as
@@ -191,7 +222,6 @@ impl HttpRequest {
         let content_type = headers.get("content-type");
         //TODO: The below if statements are disgusting
         if let Some(content_type) = content_type {
-            println!("There is a content_type");
             if content_type.starts_with("multipart") {
                 return Err("Multipart data is not allowed at this time");
                 /* Not gonna bother implementing multipart rn
@@ -322,8 +352,8 @@ fn main() {
         } 
                 
         let request = request.unwrap();
-        println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
-            request.method, request.location, request.version, request.headers, request.body);
+        // println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
+        //     request.method, request.location, request.version, request.headers, request.body);
 
         // Parse request
         match request.method.as_str() {
@@ -346,12 +376,114 @@ fn main() {
     }
 }
 
-// Handles a POST Http request
-fn handle_post(request: &HttpRequest) -> Result<(), &str> {
+// Handles a POST Http request. This is typically where PDFs are received,
+// analyzed, and sorted into the correct location. Returns a success or error
+// message.
+fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
     // According to the README, on a POST to /api/belgrade/documents, the
     // webserver is supposed to add a document to the database
     if !request.location.eq("/api/belgrade/documents") {
         return Err("POSTs can only be made to /api/belgrade/documents");
     }
-    return Ok(());
+
+    // NOTE: Assumes that PDF is sent unmodified in Body. Currently, the minimum
+    // required metadata for storing a PDF will be the date, customer, and
+    // pdf-type (Delivery Ticket or Batch Weight).
+    let pdf_as_bytes = request.body.single().unwrap();
+    
+    // Confirm that this file is indeed a PDF file
+    if !pdf_as_bytes.starts_with(b"%PDF") {
+        return Err("The PDF version header was not found");
+    }
+
+    // Decide whether Batch Weight or Delivery Ticket or Undecidable.
+    let pdf_type: PDFType;
+    let id = [b"/Widths [", CR, LF, b"600 600 600 600 600 600 600 600 600"].concat();
+    let id = id.as_slice();
+    if let Some(result) = 
+            pdf_as_bytes
+                .windows(id.len())
+                .find(|&pred| pred
+                .eq(id)) {
+        pdf_type = PDFType::BatchWeight;
+    } else {
+        let id = [b"/Widths [", CR, LF, b"277 333 474 556 556 889 722 237 333"].concat();
+        let id = id.as_slice();
+        if let Some(result) = 
+                pdf_as_bytes
+                    .windows(id.len())
+                    .find(|&pred| pred
+                    .eq(id)) {
+            pdf_type = PDFType::DeliveryTicket; 
+        } else {
+            pdf_type = PDFType::Unknown;
+        }
+    } 
+
+    // Deflate and retrieve date and project
+    let mut date = String::new();
+    let mut customer = String::new();
+    let LENGTH_PREFIX = b"<</Length ";
+    let mut i = 0;
+    while let Some(flate_header) = u8_index_of_multi(pdf_as_bytes, LENGTH_PREFIX, i, pdf_as_bytes.len()) {
+        // Get line which sets up Flate decode and extract the length from it
+        let length_start_index = flate_header + LENGTH_PREFIX.len();
+        let length_end_index = u8_index_of(&pdf_as_bytes, b'/', length_start_index, pdf_as_bytes.len()).unwrap();
+        let length = pdf_as_bytes[length_start_index..length_end_index].to_vec();
+        let digits: Vec<u8> = 
+            length
+                .iter()
+                .map(|&c| c - 48)
+                .collect();
+        let length = digits.from_digits() as usize;
+        let stream_start_index = u8_index_of(&pdf_as_bytes, CR[0], length_end_index, pdf_as_bytes.len());
+        if stream_start_index == None {
+            return Err("Could not find the start of the Flate Encoded Stream. Stream should be prefaced by a CRLF pattern, which was not detected.");
+        }
+        let stream_start_index = stream_start_index.unwrap() + 2; //NOTE: The unwrap is safe, the +2 is not
+        let stream_end_index = stream_start_index + length;
+        i = stream_end_index;
+        let stream = &pdf_as_bytes[stream_start_index..stream_end_index];
+        // println!("STREAM: {:?}", stream);
+        println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
+        let mut deflator = DeflateDecoder::new(stream);
+        let mut output_buffer  = String::new();
+        let bytes_read = deflator.read_to_string(&mut output_buffer);
+        let bytes_read = bytes_read.unwrap();
+        println!("Bytes read: {}", bytes_read);
+        // while let Ok(bytes_read) = decoder.read_to_string(&mut output_buffer) {
+        //     println!("Bytes Read: {} Buffer output: {:?}", bytes_read, &output_buffer);
+        //     // FIXME: This will break when a key, value pair is along a boundary
+        //     let DATE_PREFIX = "Tf 480.8 680 Td ("; // NOTE: This should be a const, and is used improperly
+        //     let date_pos = output_buffer.find(DATE_PREFIX);
+        //     if let Some(mut date_pos) = date_pos {
+        //         date_pos += DATE_PREFIX.len();
+        //         date = output_buffer[date_pos..date_pos+10].to_owned(); //NOTE: DANGEROUS 
+        //         println!("Date found: {}", date);
+        //     }
+            
+        //     let CUSTOMER_PREFIX = "Tf 27.2 524.8 Td (";
+        //     let customer_pos = output_buffer.find(CUSTOMER_PREFIX);
+        //     if let Some(mut customer_pos) = customer_pos {
+        //         customer_pos += CUSTOMER_PREFIX.len();
+        //         let customer_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", customer_pos, output_buffer.len()).unwrap();
+        //         customer = output_buffer[customer_pos..customer_end_pos].to_string();
+        //         println!("customer found: {}", customer);
+        //     } 
+        // }
+    }
+
+
+    let pdf_metadata = PDFMetadata { 
+        version : String::new(), 
+        date    : date,
+        pdf_type: pdf_type,
+        customer : customer,
+    };
+
+    println!("PDF Metadata: {:#?}", pdf_metadata);
+
+
+    // This is where the PDF should be parsed
+    return Ok("success");
 }
