@@ -51,7 +51,7 @@ enum Body {
 }
 
 // The various types of PDF which are processed
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum PDFType {
     BatchWeight,
     DeliveryTicket,
@@ -399,7 +399,7 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
     }
 
     // Decide whether Batch Weight or Delivery Ticket or Undecidable.
-    let pdf_type = PDFType::Unknown;
+    let pdf_type: PDFType;
     let id = [b"/Widths [", CR, LF, b"600 600 600 600 600 600 600 600 600"].concat();
     let id = id.as_slice();
     if let Some(result) = 
@@ -417,6 +417,8 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
                     .find(|&pred| pred
                     .eq(id)) {
             pdf_type = PDFType::DeliveryTicket; 
+        } else {
+            pdf_type = PDFType::Unknown;
         }
     } 
 
@@ -446,18 +448,19 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         let stream = &pdf_as_bytes[stream_start_index..stream_end_index];
         let mut output_buffer = String::new();
         zlib::Decoder::new(stream).read_to_string(&mut output_buffer);
-        // println!("size: {} zlib output: {:?}", bytes_out, &output_buffer);
+        println!("zlib output: {:?}", &output_buffer);
         // println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
         // FIXME: This will break when a key, value pair is along a boundary
-        let DATE_PREFIX: &str = if pdf_type == PDFType::DeliveryTicket {"Tf 480.8 680 Td ("} else {"test"}; // NOTE: This should be a const, and is used improperly
+        let DATE_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 480.8 680 Td ("} else {"BT 94 734 Td ("}; // NOTE: This should be a const, and is used improperly
         let date_pos = output_buffer.find(DATE_PREFIX);
         if let Some(mut date_pos) = date_pos {
             date_pos += DATE_PREFIX.len();
-            date = output_buffer[date_pos..date_pos+10].to_owned(); //NOTE: DANGEROUS 
+            let date_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", date_pos, output_buffer.len()).unwrap();
+            date = output_buffer[date_pos..date_end_pos].to_string(); //NOTE: DANGEROUS 
             println!("Date found: {}", date);
         }
         
-        let CUSTOMER_PREFIX = "Tf 27.2 524.8 Td (";
+        let CUSTOMER_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 27.2 524.8 Td ("} else {"BT 94 722 Td ("};
         let customer_pos = output_buffer.find(CUSTOMER_PREFIX);
         if let Some(mut customer_pos) = customer_pos {
             customer_pos += CUSTOMER_PREFIX.len();
@@ -475,7 +478,7 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         customer : customer,
     };
 
-    println!("PDF Metadata: {:#?}", pdf_metadata);
+    // println!("PDF Metadata: {:#?}", pdf_metadata);
 
 
     // This is where the PDF should be parsed
