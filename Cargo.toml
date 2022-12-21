@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+compress = "0.2.1"
 flate2 = { version = "1.0.17", features = ["zlib"], default-features = false }
 num-digitize = "0.4.2"
 # base64 = "0.13.0"

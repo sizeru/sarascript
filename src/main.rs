@@ -1,6 +1,8 @@
+use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
+use compress::zlib;
 use flate2::bufread::DeflateDecoder;
 use num_digitize::FromDigits;
 
@@ -444,33 +446,27 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         let stream_end_index = stream_start_index + length;
         i = stream_end_index;
         let stream = &pdf_as_bytes[stream_start_index..stream_end_index];
-        // println!("STREAM: {:?}", stream);
-        println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
-        let mut deflator = DeflateDecoder::new(stream);
-        let mut output_buffer  = String::new();
-        let bytes_read = deflator.read_to_string(&mut output_buffer);
-        let bytes_read = bytes_read.unwrap();
-        println!("Bytes read: {}", bytes_read);
-        // while let Ok(bytes_read) = decoder.read_to_string(&mut output_buffer) {
-        //     println!("Bytes Read: {} Buffer output: {:?}", bytes_read, &output_buffer);
-        //     // FIXME: This will break when a key, value pair is along a boundary
-        //     let DATE_PREFIX = "Tf 480.8 680 Td ("; // NOTE: This should be a const, and is used improperly
-        //     let date_pos = output_buffer.find(DATE_PREFIX);
-        //     if let Some(mut date_pos) = date_pos {
-        //         date_pos += DATE_PREFIX.len();
-        //         date = output_buffer[date_pos..date_pos+10].to_owned(); //NOTE: DANGEROUS 
-        //         println!("Date found: {}", date);
-        //     }
-            
-        //     let CUSTOMER_PREFIX = "Tf 27.2 524.8 Td (";
-        //     let customer_pos = output_buffer.find(CUSTOMER_PREFIX);
-        //     if let Some(mut customer_pos) = customer_pos {
-        //         customer_pos += CUSTOMER_PREFIX.len();
-        //         let customer_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", customer_pos, output_buffer.len()).unwrap();
-        //         customer = output_buffer[customer_pos..customer_end_pos].to_string();
-        //         println!("customer found: {}", customer);
-        //     } 
-        // }
+        let mut output_buffer = String::new();
+        zlib::Decoder::new(stream).read_to_string(&mut output_buffer);
+        // println!("size: {} zlib output: {:?}", bytes_out, &output_buffer);
+        // println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
+        // FIXME: This will break when a key, value pair is along a boundary
+        let DATE_PREFIX = "Tf 480.8 680 Td ("; // NOTE: This should be a const, and is used improperly
+        let date_pos = output_buffer.find(DATE_PREFIX);
+        if let Some(mut date_pos) = date_pos {
+            date_pos += DATE_PREFIX.len();
+            date = output_buffer[date_pos..date_pos+10].to_owned(); //NOTE: DANGEROUS 
+            println!("Date found: {}", date);
+        }
+        
+        let CUSTOMER_PREFIX = "Tf 27.2 524.8 Td (";
+        let customer_pos = output_buffer.find(CUSTOMER_PREFIX);
+        if let Some(mut customer_pos) = customer_pos {
+            customer_pos += CUSTOMER_PREFIX.len();
+            let customer_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", customer_pos, output_buffer.len()).unwrap();
+            customer = output_buffer[customer_pos..customer_end_pos].to_string();
+            println!("customer found: {}", customer);
+        } 
     }
 
 
