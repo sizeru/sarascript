@@ -399,7 +399,7 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
     }
 
     // Decide whether Batch Weight or Delivery Ticket or Undecidable.
-    let pdf_type: PDFType;
+    let pdf_type = PDFType::Unknown;
     let id = [b"/Widths [", CR, LF, b"600 600 600 600 600 600 600 600 600"].concat();
     let id = id.as_slice();
     if let Some(result) = 
@@ -417,8 +417,6 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
                     .find(|&pred| pred
                     .eq(id)) {
             pdf_type = PDFType::DeliveryTicket; 
-        } else {
-            pdf_type = PDFType::Unknown;
         }
     } 
 
@@ -451,7 +449,7 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         // println!("size: {} zlib output: {:?}", bytes_out, &output_buffer);
         // println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
         // FIXME: This will break when a key, value pair is along a boundary
-        let DATE_PREFIX = "Tf 480.8 680 Td ("; // NOTE: This should be a const, and is used improperly
+        let DATE_PREFIX: &str = if pdf_type == PDFType::DeliveryTicket {"Tf 480.8 680 Td ("} else {"test"}; // NOTE: This should be a const, and is used improperly
         let date_pos = output_buffer.find(DATE_PREFIX);
         if let Some(mut date_pos) = date_pos {
             date_pos += DATE_PREFIX.len();
