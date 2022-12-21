@@ -3,7 +3,6 @@ use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
 use compress::zlib;
-use flate2::bufread::DeflateDecoder;
 use num_digitize::FromDigits;
 
 use crate::Body::{Single, MultiPart};
@@ -14,7 +13,7 @@ const GB: usize = MB * 1024;
 const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const MAX_REQ: usize = (64 * KB) - 1;
+const MAX_REQ: usize = (256 * KB) - 1;
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
 
@@ -80,7 +79,6 @@ struct HttpRequest {
 // Stores PDF metadata
 #[derive(Debug)]
 struct PDFMetadata {
-    version: String,
     pdf_type: PDFType,
     date: String, // could easily store this as a different datatype to save space
     customer: String,
@@ -259,15 +257,18 @@ impl HttpRequest {
                 */
             } else {
                 let mut body = Vec::new();
-                match (&content_length, body_in_buffer) {
+                match (content_length, body_in_buffer) {
                     (Some(length), false) => {
+                        println!("Hopeful path");
                         if let Ok(length) = length.parse::<usize>() {
                             body.resize(length, b'\0');
                             let mut bytes_read = stream.read(&mut body).unwrap();
-                            while bytes_read > 0 && bytes_read < body.len() {
-                                bytes_read = stream.read(&mut body).unwrap();
+                            println!("bytes_read: {} body len: {}", bytes_read, body.len());
+                            while bytes_read < body.len() { // FIXME: This is bugged. When content is passed in multiple buffer, the second read overwrites the buffer of the first. 
+                                bytes_read += stream.read(&mut body).unwrap();
+                                println!("bytes_read: {} body len: {}", bytes_read, body.len());
                             }
-                            
+                            println!("got here");
                         } // The sender (client) should be informed of what's going on here. The request has a content length header that is not made up of entirely numbers
                     },
                     // The next two options are caused when there is no
@@ -304,7 +305,7 @@ impl HttpRequest {
         } else {
             let mut body: Vec<u8> = Vec::new();
             match (&content_length, body_in_buffer) {
-                (Some(length), false) => {
+                (Some(length), _) => {
                     if let Ok(length) = length.parse::<usize>() {
                         body.resize(length, b'\0');
                         let mut reader = BufReader::new(stream);
@@ -313,7 +314,7 @@ impl HttpRequest {
                 },
                 // The next two options are caused when there is no Content-Length header. IMO this is undefined behavior, and we should let the client know something is wrong
                 (None, false) => (),
-                (_, true) => {
+                (None, true) => {
                     body = request_as_bytes[body_start..].to_vec();
                 }
             };
@@ -338,7 +339,11 @@ fn main() {
         let request_size = stream.read(&mut raw_request).unwrap();
         println!("Request size: {}", request_size);
 
-        if request_size > MAX_REQ {
+        // FIXME: This part of code will never be reached, since strea.read()
+        // will not overflow the buffer. What really should happen in this whole
+        // program is an attempt at buffered reading. This would also make it so
+        // that the memory footprint would be constant
+        if request_size > MAX_REQ { 
             stream.write(
                 response!("400 Bad Request", "Http Request is larger than max allowed request (64KB).")
             ).unwrap();
@@ -352,8 +357,9 @@ fn main() {
             stream.flush().unwrap();
             continue;
         } 
-                
+        
         let request = request.unwrap();
+        println!("Body size: {} Headers: {:#?}", request.body.single().unwrap().len(), request.headers);
         // println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
         //     request.method, request.location, request.version, request.headers, request.body);
 
@@ -363,7 +369,9 @@ fn main() {
                 stream.write(response!("200 OK", "GET REQUEST RECEIVED")).unwrap()
             }
             "POST" => {
+                println!("Attemping to process post");
                 if let Err(error) = handle_post(&request) {
+                    println!("ERROR IN HANDLING REQUEST: {}", error);
                     stream.write(response!("400 Bad Request", error));
                     stream.flush().unwrap();
                     continue;
@@ -422,7 +430,13 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         }
     } 
 
-    // Deflate and retrieve date and project
+    // Deflate and retrieve date and customer. FIXME: This currently breaks when
+    // ticket requests are received to quickly. I am not sure why this may
+    // occur, but I believe this may be because when testing with curl, there is
+    // an attempt to have a keep alive or something when rapidly sending large
+    // requests, and this is not implemented. More research needs to be done,
+    // but this won't be a problem so long as the server responds saying that
+    // the request did not go through. 
     let mut date = String::new();
     let mut customer = String::new();
     let LENGTH_PREFIX = b"<</Length ";
@@ -447,8 +461,9 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         i = stream_end_index;
         let stream = &pdf_as_bytes[stream_start_index..stream_end_index];
         let mut output_buffer = String::new();
+        println!("=======CHECKPOINT=========");
         zlib::Decoder::new(stream).read_to_string(&mut output_buffer);
-        println!("zlib output: {:?}", &output_buffer);
+        // println!("zlib output: {:?}", &output_buffer);
         // println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
         // FIXME: This will break when a key, value pair is along a boundary
         let DATE_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 480.8 680 Td ("} else {"BT 94 734 Td ("}; // NOTE: This should be a const, and is used improperly
@@ -472,13 +487,12 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
 
 
     let pdf_metadata = PDFMetadata { 
-        version : String::new(), 
         date    : date,
         pdf_type: pdf_type,
         customer : customer,
     };
 
-    // println!("PDF Metadata: {:#?}", pdf_metadata);
+    println!("PDF Metadata: {:#?}", pdf_metadata);
 
 
     // This is where the PDF should be parsed
