@@ -2,6 +2,8 @@
 
 This site is mainly handled by an nginx webserver, which is used to direct content to the right place. In the future, this webserver may be replaced by a custom solution.
 
+Postgres is sometimes difficult to installa, but may be installed on Debian by default
+
 When belgrade is accessed, nginx will redirect the request to a rust webserver
 
 This site uses a custom webserver in the backend (using Rust) to serve up webpages and APIs. APIs follow the REST method of organizing content.

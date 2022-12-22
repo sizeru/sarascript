@@ -2,11 +2,13 @@ use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
+use chrono::{Utc, TimeZone};
 use compress::zlib;
 use num_digitize::FromDigits;
-
+use postgres::{Client, NoTls};
 use crate::Body::{Single, MultiPart};
 
+// RUST WEBSERVER CONSTANTS
 const KB: usize = 1024;
 const MB: usize = KB * 1024;
 const GB: usize = MB * 1024;
@@ -16,6 +18,9 @@ const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
 const MAX_REQ: usize = (256 * KB) - 1;
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
+
+// DATABASE CONSTANTS
+
 
 // NOTE: Receiving multipart/formdata is not currently supported.
 
@@ -50,11 +55,11 @@ enum Body {
 }
 
 // The various types of PDF which are processed
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PDFType {
-    BatchWeight,
-    DeliveryTicket,
-    Unknown
+    Unknown = 0,
+    BatchWeight = 1,
+    DeliveryTicket = 2,
 }
 
 // When FormData is recieved in an HTTP request, each FormData contains
@@ -82,6 +87,7 @@ struct PDFMetadata {
     pdf_type: PDFType,
     date: String, // could easily store this as a different datatype to save space
     customer: String,
+    relative_path: String,
 }
 
 // Formats an HTTP response to an array of bytes.
@@ -327,9 +333,10 @@ impl HttpRequest {
 // The main loop for the webserver
 fn main() {
     
+    // Create singletons which will be used throughout the program
     let listener = TcpListener::bind(LOCAL).expect("Could not connect to server");
-    
-    
+    let mut db = Client::connect("postgresql://nate:testpasswd@localhost/rmc", NoTls).unwrap();
+        
     // Listens for a connection
     for stream in listener.incoming() {
         
@@ -370,7 +377,7 @@ fn main() {
             }
             "POST" => {
                 println!("Attemping to process post");
-                if let Err(error) = handle_post(&request) {
+                if let Err(error) = handle_post(&request, &mut db) {
                     println!("ERROR IN HANDLING REQUEST: {}", error);
                     stream.write(response!("400 Bad Request", error));
                     stream.flush().unwrap();
@@ -384,16 +391,18 @@ fn main() {
 
         stream.flush().unwrap();
     }
+
+    db.close().unwrap(); 
 }
 
 // Handles a POST Http request. This is typically where PDFs are received,
 // analyzed, and sorted into the correct location. Returns a success or error
 // message.
-fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
+fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String> {
     // According to the README, on a POST to /api/belgrade/documents, the
     // webserver is supposed to add a document to the database
     if !request.location.eq("/api/belgrade/documents") {
-        return Err("POSTs can only be made to /api/belgrade/documents");
+        return Err("POSTs can only be made to /api/belgrade/documents".to_owned());
     }
 
     // NOTE: Assumes that PDF is sent unmodified in Body. Currently, the minimum
@@ -403,7 +412,7 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
     
     // Confirm that this file is indeed a PDF file
     if !pdf_as_bytes.starts_with(b"%PDF") {
-        return Err("The PDF version header was not found");
+        return Err("The PDF version header was not found".to_owned());
     }
 
     // Decide whether Batch Weight or Delivery Ticket or Undecidable.
@@ -454,7 +463,7 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
         let length = digits.from_digits() as usize;
         let stream_start_index = u8_index_of(&pdf_as_bytes, CR[0], length_end_index, pdf_as_bytes.len());
         if stream_start_index == None {
-            return Err("Could not find the start of the Flate Encoded Stream. Stream should be prefaced by a CRLF pattern, which was not detected.");
+            return Err("Could not find the start of the Flate Encoded Stream. Stream should be prefaced by a CRLF pattern, which was not detected.".to_owned());
         }
         let stream_start_index = stream_start_index.unwrap() + 2; //NOTE: The unwrap is safe, the +2 is not
         let stream_end_index = stream_start_index + length;
@@ -472,7 +481,6 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
             date_pos += DATE_PREFIX.len();
             let date_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", date_pos, output_buffer.len()).unwrap();
             date = output_buffer[date_pos..date_end_pos].to_string(); //NOTE: DANGEROUS 
-            println!("Date found: {}", date);
         }
         
         let CUSTOMER_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 27.2 524.8 Td ("} else {"BT 94 722 Td ("};
@@ -481,20 +489,55 @@ fn handle_post(request: &HttpRequest) -> Result<&str, &str> {
             customer_pos += CUSTOMER_PREFIX.len();
             let customer_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", customer_pos, output_buffer.len()).unwrap();
             customer = output_buffer[customer_pos..customer_end_pos].to_string();
-            println!("customer found: {}", customer);
         } 
     }
 
+    // Parse date into generic format
+    let mut datetime = Utc::now();
+    println!("Date: {}", date);
+    if pdf_type == PDFType::BatchWeight {
+        date = format!("{} 00:00:00", date);
+        datetime = Utc.datetime_from_str(&date.as_str(), "%e-%b-%Y %H:%M:%S").unwrap();
+    } else if pdf_type == PDFType::DeliveryTicket {
+        date = format!("{} 00:00:00", date);
+        datetime = Utc.datetime_from_str(&date.as_str(), "%d/%m/%Y %H:%M:%S").unwrap();
+    }
+
+    // Generate a relative filepath (including filename) of the PDF. Files will be sorted in folders by years and then months
+    let result_row = db.query(
+        "SELECT COUNT(*) FROM pdfs WHERE pdf_date = $1;",
+        &[&datetime]
+    );
+    if let Err(e) = result_row {
+        println!("line 512: {}", e);
+        return Err(e.to_string());
+    }
+    let result_row = result_row.unwrap();
+    let num_rows: i64 = result_row[0].get(0);
+    let relative_filepath = format!("{}/{}.pdf",datetime.format("%Y/%m").to_string(),num_rows.to_string());
+    
+    // Place the PDF file into the correct place into the filesystem
+    // TODO: Some file system IO should happen here
 
     let pdf_metadata = PDFMetadata { 
-        date    : date,
+        date    : date, // NOTE: As of Dec 21 2022, this date uses a different format in Batch Weights vs Delivery Tickets
         pdf_type: pdf_type,
         customer : customer,
+        relative_path: relative_filepath,
     };
 
-    println!("PDF Metadata: {:#?}", pdf_metadata);
+    println!("METADATA: {:#?}", pdf_metadata);
+
+    // Store PDF into Database
+    db.query(concat!("INSERT INTO pdfs (pdf_type, pdf_date, customer, relative_path)",
+            "VALUES ($1, $2, $3, $4);"),
+            &[&(pdf_metadata.pdf_type as i32),
+            &datetime, 
+            &pdf_metadata.customer,
+            &pdf_metadata.relative_path]
+    ).unwrap();
 
 
     // This is where the PDF should be parsed
-    return Ok("success");
+    return Ok("success".to_owned());
 }

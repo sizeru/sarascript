@@ -6,8 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+chrono = "0.4.23"
 compress = "0.2.1"
 num-digitize = "0.4.2"
+postgres = { versio="0.19.4", features=["with-chrono-0_4"] }
 # base64 = "0.13.0"
 # lazy_static = "1.4.0"
 # regex = "1.5.4"
