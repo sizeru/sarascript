@@ -1,8 +1,10 @@
+use std::env;
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
-use chrono::{Utc, TimeZone};
+use chrono::{Utc, TimeZone, DateTime};
+use chrono_tz::Etc::{GMTMinus4, GMTPlus4};
 use compress::zlib;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
@@ -18,6 +20,10 @@ const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
 const MAX_REQ: usize = (256 * KB) - 1;
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
+#[cfg(debug_assertions)]
+const PDF_FILEPATH: &str = "debug";
+#[cfg(not(debug_assertions))]
+const PDF_FILEPATH: &str = "/var/www/rmc/belgade/documents/";
 
 // DATABASE CONSTANTS
 
@@ -44,6 +50,28 @@ const LF: &[u8] = &[10 as u8];
 // Put them into a website
 // Let you search by them
 // Hugo tutorial
+
+// Formats an HTTP response to an array of bytes.
+macro_rules! response {
+    ($response_code: expr, $message: expr) => {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}\r\n",
+            $response_code, $message.len() + 2, $message
+        ).as_bytes()
+    };
+} 
+
+// Println only in debug
+#[cfg(debug_assertions)]
+macro_rules! debug_println {
+    ($($input:expr),*) => {
+        println!($($input),+);
+    };
+}
+#[cfg(not(debug_assertions))]
+macro_rules! debug_println {
+    ($($input:expr),*) => {()}
+}
 
 // The body of an HTTP request will be stored as either a raw of bytes, or a
 // struct called FormData which is used as the value for a MultiPart enum. More
@@ -81,24 +109,18 @@ struct HttpRequest {
     body: Body // Body is typically stored as a raw byte array
 }
 
+// Create a timezone for Atlantic Standard Time (UTC-4)
+
+
 // Stores PDF metadata
 #[derive(Debug)]
 struct PDFMetadata {
     pdf_type: PDFType,
-    date: String, // could easily store this as a different datatype to save space
+    datetime: DateTime<Utc>, // could easily store this as a different datatype to save space
     customer: String,
     relative_path: String,
+    doc_number: i32,
 }
-
-// Formats an HTTP response to an array of bytes.
-macro_rules! response {
-    ($response_code: expr, $message: expr) => {
-        format!(
-            "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}\r\n",
-            $response_code, $message.len() + 2, $message
-        ).as_bytes()
-    };
-} 
 
 // Finds the index of the first predicate (the byte to be searched for) in an
 // array of bytes. Searches over a specified range. Returns None if the
@@ -265,16 +287,16 @@ impl HttpRequest {
                 let mut body = Vec::new();
                 match (content_length, body_in_buffer) {
                     (Some(length), false) => {
-                        println!("Hopeful path");
+                        debug_println!("Hopeful path");
                         if let Ok(length) = length.parse::<usize>() {
                             body.resize(length, b'\0');
-                            let mut bytes_read = stream.read(&mut body).unwrap();
-                            println!("bytes_read: {} body len: {}", bytes_read, body.len());
+                            let mut bytes_read = stream.read(&mut body).unwrap(); // A connection can be forcibly closed by the client, at this point the program will crash
+                            debug_println!("bytes_read: {} body len: {}", bytes_read, body.len());
                             while bytes_read < body.len() { // FIXME: This is bugged. When content is passed in multiple buffer, the second read overwrites the buffer of the first. 
                                 bytes_read += stream.read(&mut body).unwrap();
-                                println!("bytes_read: {} body len: {}", bytes_read, body.len());
+                                debug_println!("bytes_read: {} body len: {}", bytes_read, body.len());
                             }
-                            println!("got here");
+                            debug_println!("got here");
                         } // The sender (client) should be informed of what's going on here. The request has a content length header that is not made up of entirely numbers
                     },
                     // The next two options are caused when there is no
@@ -284,7 +306,7 @@ impl HttpRequest {
                     // request was invalid.
                     (None, false) => (),
                     (_, true) => {
-                        println!("Body was in buffer");
+                        debug_println!("Body was in buffer");
                         body = request_as_bytes[body_start..].to_vec();
                     }
                 };
@@ -332,6 +354,8 @@ impl HttpRequest {
 
 // The main loop for the webserver
 fn main() {
+
+    debug_println!("Working Directory: {:?}\nExecutable Directory: {:?}", env::current_dir().unwrap(), env::current_exe().unwrap());
     
     // Create singletons which will be used throughout the program
     let listener = TcpListener::bind(LOCAL).expect("Could not connect to server");
@@ -344,7 +368,7 @@ fn main() {
         let mut raw_request = [b'\0'; MAX_REQ]; // Max request size
         let mut stream = stream.unwrap();
         let request_size = stream.read(&mut raw_request).unwrap();
-        println!("Request size: {}", request_size);
+        debug_println!("Request size: {}", request_size);
 
         // FIXME: This part of code will never be reached, since strea.read()
         // will not overflow the buffer. What really should happen in this whole
@@ -366,8 +390,8 @@ fn main() {
         } 
         
         let request = request.unwrap();
-        println!("Body size: {} Headers: {:#?}", request.body.single().unwrap().len(), request.headers);
-        // println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
+        debug_println!("Body size: {} Headers: {:#?}", request.body.single().unwrap().len(), request.headers);
+        // debug_println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
         //     request.method, request.location, request.version, request.headers, request.body);
 
         // Parse request
@@ -376,9 +400,9 @@ fn main() {
                 stream.write(response!("200 OK", "GET REQUEST RECEIVED")).unwrap()
             }
             "POST" => {
-                println!("Attemping to process post");
+                debug_println!("Attemping to process post");
                 if let Err(error) = handle_post(&request, &mut db) {
-                    println!("ERROR IN HANDLING REQUEST: {}", error);
+                    debug_println!("ERROR IN HANDLING REQUEST: {}", error);
                     stream.write(response!("400 Bad Request", error));
                     stream.flush().unwrap();
                     continue;
@@ -412,7 +436,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
     
     // Confirm that this file is indeed a PDF file
     if !pdf_as_bytes.starts_with(b"%PDF") {
-        return Err("The PDF version header was not found".to_owned());
+        return Err("PDF File not detected: The PDF version header was not found".to_owned());
     }
 
     // Decide whether Batch Weight or Delivery Ticket or Undecidable.
@@ -448,6 +472,8 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
     // the request did not go through. 
     let mut date = String::new();
     let mut customer = String::new();
+    let mut doc_number = 0;
+    let mut time = String::new();
     let LENGTH_PREFIX = b"<</Length ";
     let mut i = 0;
     while let Some(flate_header) = u8_index_of_multi(pdf_as_bytes, LENGTH_PREFIX, i, pdf_as_bytes.len()) {
@@ -463,17 +489,17 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         let length = digits.from_digits() as usize;
         let stream_start_index = u8_index_of(&pdf_as_bytes, CR[0], length_end_index, pdf_as_bytes.len());
         if stream_start_index == None {
-            return Err("Could not find the start of the Flate Encoded Stream. Stream should be prefaced by a CRLF pattern, which was not detected.".to_owned());
+            return Err("Could not find the start of the Flate Encoded Stream. Stream should be prefaced by a CRLF pattern, which was not detected. This can occur when the data is not sent as a binary file.".to_owned());
         }
         let stream_start_index = stream_start_index.unwrap() + 2; //NOTE: The unwrap is safe, the +2 is not
         let stream_end_index = stream_start_index + length;
         i = stream_end_index;
         let stream = &pdf_as_bytes[stream_start_index..stream_end_index];
         let mut output_buffer = String::new();
-        println!("=======CHECKPOINT=========");
+        debug_println!("=======CHECKPOINT=========");
         zlib::Decoder::new(stream).read_to_string(&mut output_buffer);
-        // println!("zlib output: {:?}", &output_buffer);
-        // println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
+        // debug_println!("zlib output: {:?}", &output_buffer);
+        // debug_println!("Stream start: {} End: {} Size: {} Length: {}", stream_start_index, stream_end_index, stream.len(), length);
         // FIXME: This will break when a key, value pair is along a boundary
         let DATE_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 480.8 680 Td ("} else {"BT 94 734 Td ("}; // NOTE: This should be a const, and is used improperly
         let date_pos = output_buffer.find(DATE_PREFIX);
@@ -481,6 +507,22 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
             date_pos += DATE_PREFIX.len();
             let date_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", date_pos, output_buffer.len()).unwrap();
             date = output_buffer[date_pos..date_end_pos].to_string(); //NOTE: DANGEROUS 
+        }
+
+        let DOC_NUM_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 480.8 668.8 Td ("} else {"BT 353.2 710 Td ("};
+        let doc_num_pos = output_buffer.find(DOC_NUM_PREFIX);
+        if let Some(mut doc_num_pos) = doc_num_pos {
+            doc_num_pos += DOC_NUM_PREFIX.len();
+            let doc_num_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", doc_num_pos, output_buffer.len()).unwrap();
+            doc_number = output_buffer[doc_num_pos..doc_num_end_pos].parse().unwrap(); //NOTE: DANGEROUS 
+        }
+
+        let TIME_PREFIX = if pdf_type == PDFType::DeliveryTicket {""} else {"BT 353.2 686 Td ("}; // NOTE: This should be a const, and is used improperly
+        let time_pos = output_buffer.find(TIME_PREFIX);
+        if time_pos != None && pdf_type == PDFType::BatchWeight {
+            let time_pos = time_pos.unwrap() + TIME_PREFIX.len();
+            let time_end_pos = u8_index_of_multi(&output_buffer.as_bytes(), b")Tj", time_pos, output_buffer.len()).unwrap();
+            time = output_buffer[time_pos..time_end_pos].to_string(); //NOTE: DANGEROUS 
         }
         
         let CUSTOMER_PREFIX = if pdf_type == PDFType::DeliveryTicket {"Tf 27.2 524.8 Td ("} else {"BT 94 722 Td ("};
@@ -492,46 +534,55 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         } 
     }
 
-    // Parse date into generic format
-    let mut datetime = Utc::now();
-    println!("Date: {}", date);
+    // Parse string date formats into Chrono (ISO 8601) date formats. Delivery
+    // Tickets all currently have their DateTimes set to 12 noon EST, since
+    // extracting their datetimes is hard and cannot be done yet. More info in
+    // issue 3 on GitHub.
+    let mut datetime = Utc.timestamp_nanos(0);
     if pdf_type == PDFType::BatchWeight {
-        date = format!("{} 00:00:00", date);
-        datetime = Utc.datetime_from_str(&date.as_str(), "%e-%b-%Y %H:%M:%S").unwrap();
+        let combined = format!("{} {}", &date, &time);
+        debug_println!("date: {}, time: {}, combined: {}", &date, &time, &combined);
+        datetime = GMTPlus4.datetime_from_str(&combined, "%e-%b-%Y %I:%M:%S %p").unwrap().with_timezone(&Utc);
     } else if pdf_type == PDFType::DeliveryTicket {
-        date = format!("{} 00:00:00", date);
-        datetime = Utc.datetime_from_str(&date.as_str(), "%d/%m/%Y %H:%M:%S").unwrap();
+        let combined = format!("{} 12:00:00", &date);
+        debug_println!("date: {}", &combined);
+        datetime = GMTPlus4.datetime_from_str(&combined, "%d/%m/%Y %H:%M:%S").unwrap().with_timezone(&Utc); 
     }
 
     // Generate a relative filepath (including filename) of the PDF. Files will be sorted in folders by years and then months
     let result_row = db.query(
-        "SELECT COUNT(*) FROM pdfs WHERE pdf_date = $1;",
-        &[&datetime]
+        "SELECT COUNT(*) FROM pdfs WHERE CAST(pdf_datetime as DATE) = $1 AND pdf_num = $2;",
+        &[&datetime.date_naive(), &(doc_number as i32)] // NOTE: This cast is redundant, but VSCode thinks it is an error without it. Rust does not. It compiles and runs and passes testcases.
     );
     if let Err(e) = result_row {
-        println!("line 512: {}", e);
         return Err(e.to_string());
     }
     let result_row = result_row.unwrap();
-    let num_rows: i64 = result_row[0].get(0);
-    let relative_filepath = format!("{}/{}.pdf",datetime.format("%Y/%m").to_string(),num_rows.to_string());
+    let num_entries: i64 = result_row[0].get(0);
+    
+    let duplicate = if num_entries == 0 {String::new()} else {format!("_{}",num_entries.to_string())}; // There should only ever be one entry for this, but should a duplicate arise this handles it.
+    let type_initials = if pdf_type == PDFType::DeliveryTicket {"DT"} else if pdf_type == PDFType::BatchWeight {"BW"} else {"ZZ"};
+    let relative_filepath = format!("{}_{}_{}{}{}.pdf",datetime.format("%Y/%b/%d").to_string(), customer, type_initials, doc_number, duplicate); // eg. 2022/Aug/7_John Doe_DT154.pdf
     
     // Place the PDF file into the correct place into the filesystem
+    // let pdf_file = File::create(path);
     // TODO: Some file system IO should happen here
 
     let pdf_metadata = PDFMetadata { 
-        date    : date, // NOTE: As of Dec 21 2022, this date uses a different format in Batch Weights vs Delivery Tickets
-        pdf_type: pdf_type,
-        customer : customer,
-        relative_path: relative_filepath,
+        datetime:       datetime, // NOTE: As of Dec 21 2022, this date uses a different format in Batch Weights vs Delivery Tickets
+        pdf_type:       pdf_type,
+        customer :      customer,
+        relative_path:  relative_filepath,
+        doc_number:     doc_number,
     };
 
-    println!("METADATA: {:#?}", pdf_metadata);
+    debug_println!("METADATA: {:#?}", pdf_metadata);
 
     // Store PDF into Database
-    db.query(concat!("INSERT INTO pdfs (pdf_type, pdf_date, customer, relative_path)",
-            "VALUES ($1, $2, $3, $4);"),
+    db.query(concat!("INSERT INTO pdfs (pdf_type, pdf_num, pdf_datetime, customer, relative_path)",
+            "VALUES ($1, $2, $3, $4, $5);"),
             &[&(pdf_metadata.pdf_type as i32),
+            &pdf_metadata.doc_number,
             &datetime, 
             &pdf_metadata.customer,
             &pdf_metadata.relative_path]
