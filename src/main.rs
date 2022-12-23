@@ -1,8 +1,9 @@
-use std::env;
+use std::{env, fs};
 use std::fs::File;
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
+use std::path::Path;
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::{GMTMinus4, GMTPlus4};
 use compress::zlib;
@@ -20,10 +21,7 @@ const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
 const MAX_REQ: usize = (256 * KB) - 1;
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
-#[cfg(debug_assertions)]
-const PDF_FILEPATH: &str = "debug";
-#[cfg(not(debug_assertions))]
-const PDF_FILEPATH: &str = "/var/www/rmc/belgade/documents/";
+const PDFS_FILEPATH: &str = r"C:/dev/rmc/site/belgrade/documents/";
 
 // DATABASE CONSTANTS
 
@@ -477,6 +475,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
     let LENGTH_PREFIX = b"<</Length ";
     let mut i = 0;
     while let Some(flate_header) = u8_index_of_multi(pdf_as_bytes, LENGTH_PREFIX, i, pdf_as_bytes.len()) {
+        if pdf_type == PDFType::Unknown {break;}
         // Get line which sets up Flate decode and extract the length from it
         let length_start_index = flate_header + LENGTH_PREFIX.len();
         let length_end_index = u8_index_of(&pdf_as_bytes, b'/', length_start_index, pdf_as_bytes.len()).unwrap();
@@ -547,6 +546,8 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         let combined = format!("{} 12:00:00", &date);
         debug_println!("date: {}", &combined);
         datetime = GMTPlus4.datetime_from_str(&combined, "%d/%m/%Y %H:%M:%S").unwrap().with_timezone(&Utc); 
+    } else {
+        datetime = Utc.with_ymd_and_hms(1970, 1, 1, 12, 0, 0).unwrap();
     }
 
     // Generate a relative filepath (including filename) of the PDF. Files will be sorted in folders by years and then months
@@ -564,10 +565,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
     let type_initials = if pdf_type == PDFType::DeliveryTicket {"DT"} else if pdf_type == PDFType::BatchWeight {"BW"} else {"ZZ"};
     let relative_filepath = format!("{}_{}_{}{}{}.pdf",datetime.format("%Y/%b/%d").to_string(), customer, type_initials, doc_number, duplicate); // eg. 2022/Aug/7_John Doe_DT154.pdf
     
-    // Place the PDF file into the correct place into the filesystem
-    // let pdf_file = File::create(path);
-    // TODO: Some file system IO should happen here
-
+    
     let pdf_metadata = PDFMetadata { 
         datetime:       datetime, // NOTE: As of Dec 21 2022, this date uses a different format in Batch Weights vs Delivery Tickets
         pdf_type:       pdf_type,
@@ -575,7 +573,18 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         relative_path:  relative_filepath,
         doc_number:     doc_number,
     };
-
+    
+    // Place the PDF file into the correct place into the filesystem
+    {
+        let path_string = format!("{}{}", PDFS_FILEPATH, &pdf_metadata.relative_path);
+        let path = Path::new(&path_string);
+        let prefix = path.parent().unwrap(); // path without final component
+        debug_println!("Prefix: {:?}", prefix);
+        fs::create_dir_all(prefix).unwrap();
+        let mut pdf_file = File::create(&path_string).unwrap();
+        pdf_file.write_all(pdf_as_bytes).unwrap();
+    }
+    
     debug_println!("METADATA: {:#?}", pdf_metadata);
 
     // Store PDF into Database
@@ -590,5 +599,5 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
 
 
     // This is where the PDF should be parsed
-    return Ok("success".to_owned());
+    return Ok("PDF received and stored on server succesfully".to_owned());
 }
