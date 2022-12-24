@@ -181,7 +181,11 @@ impl HttpRequest {
         if request_size == 0 {
             return Err("Http Request received with length 0");
         }
-        let method_end = u8_index_of(request_as_bytes, b' ', 0, request_size).unwrap();
+        let method_end = u8_index_of(request_as_bytes, b' ', 0, request_size);
+        if let None = method_end {
+            return Err("Could not decode message. May not have been a true HTTP request");
+        }
+        let method_end = method_end.unwrap();
         let method = String::from_utf8_lossy(&request_as_bytes[..method_end]).into_owned();
 
         let location_end = u8_index_of(request_as_bytes, b' ', method_end + 1,  request_size);
@@ -219,8 +223,11 @@ impl HttpRequest {
             },
             (_, false) => ()
         }
-        let mut header_end = u8_index_of(request_as_bytes, b'\r', header_start, request_size)
-            .expect("HTTP request is malformed. Each header must end with CRLF");
+        let header_end = u8_index_of(request_as_bytes, b'\r', header_start, request_size);
+        if header_end == None {
+            return Err("HTTP request is malformed. Each header must end with CRLF");
+        }
+        let mut header_end = header_end.unwrap();
         let head_end = u8_index_of_multi(request_as_bytes, b"\r\n\r\n", header_end, request_size)
             .expect("HTTP request is malformed. Head must end with CRLF CRLF");
         let mut headers: HashMap<String, String> = HashMap::new();
@@ -395,7 +402,17 @@ fn main() {
         // Parse request
         match request.method.as_str() {
             "GET" => {
-                stream.write(response!("200 OK", "GET REQUEST RECEIVED")).unwrap()
+                let response = handle_get(&request, &mut db);
+                match response {
+                    Ok(success_message) => {
+                        stream.write(response!("200 OK", &success_message));
+                    }
+                    Err(error_message) => {
+                        stream.write(response!("400 Bad Request", &error_message));
+                    }
+                }
+                stream.flush().unwrap();
+                break;
             }
             "POST" => {
                 debug_println!("Attemping to process post");
@@ -403,10 +420,10 @@ fn main() {
                     debug_println!("ERROR IN HANDLING REQUEST: {}", error);
                     stream.write(response!("400 Bad Request", error));
                     stream.flush().unwrap();
-                    continue;
+                    break;
                 }
                 
-                stream.write( response!("200 OK", "POST received")).unwrap()
+                stream.write( response!("201 Created", "POST Received and Processed")).unwrap()
             }
             _=> stream.write(response!("400 Bad Request", [request.method.as_str(), "is not supported yet"].join(" "))).unwrap() 
         };
@@ -415,6 +432,13 @@ fn main() {
     }
 
     db.close().unwrap(); 
+}
+
+// Handles a get to belgrade
+fn handle_get(request: &HttpRequest, db: &mut Client) -> Result <String, String> {
+    // 1. Verify Location [/belgrade/documents(/.*)]
+    // 2. 
+    return Ok(format!("placeholder"));
 }
 
 // Handles a POST Http request. This is typically where PDFs are received,
