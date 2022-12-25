@@ -36,25 +36,6 @@ const POSTGRES_ADDRESS: &str = r"postgresql://nate:testpasswd@localhost/rmc";
 // very low priority. All data must be sent as a binary stream in the body of a
 // request.
 
-/*
- * TODO
- * 
- * 2. For now, this program will load the ENTIRE http request into memory. This drastically limits
- *      the size of requests you can process. This is okay since the size of requests are known
- *      beforehand. (The largest will be running PUT with a PDF file a few dozen KB in length). But
- *      I'd like to handle larger payloads using streams, buffers, file io, etc.
- * 3. TODO: Error, a crash can happen on a line with TODO: ERROR relating to headers without values
- * 4. TODO: Either read files in 8KB increments, or do not allow any HTTP requests larger than 8KB. 
- *      This prevents eating up all memory. It must be limited somehow to avoid a random 1GB PDF file 
- *      eating up all the memory.
- */
-
-// Implement parsing of multipart/formdata 
-// Implement extraction of PDFs
-// Put them into a website
-// Let you search by them
-// Hugo tutorial
-
 // Formats an HTTP response to an array of bytes.
 macro_rules! response {
     ($response_code: expr, $message: expr) => {
