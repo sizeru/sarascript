@@ -9,9 +9,10 @@ use chrono_tz::Etc::{GMTMinus4, GMTPlus4};
 use compress::zlib;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
-use crate::Body::{Single, MultiPart};
+use crate::Body::{Single, MultiPart}; //NOTE: See [2]
 
 // RUST WEBSERVER CONSTANTS
+const REQUEST_BUFFER_SIZE: u16 = 4096; //NOTE: See [1]
 const KB: usize = 1024;
 const MB: usize = KB * 1024;
 const GB: usize = MB * 1024;
@@ -22,17 +23,22 @@ const MAX_REQ: usize = (256 * KB) - 1;
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
 const PDFS_FILEPATH: &str = r"C:/dev/rmc/site/belgrade/documents/";
+const POSTGRES_ADDRESS: &str = r"postgresql://nate:testpasswd@localhost/rmc";
 
-// DATABASE CONSTANTS
+// [1] The current request buffer size is 4KB, the pagesize on the computer I'm
+// running the server on (and most Linux servers as of 2022 Dec). In theory,
+// memory aligned data speeds up data access by keeping the cache hot, and makes
+// the maximal use of memory, but I can't help but feel that I'm missing
+// something. More research and testing needs to be done to find the optimal
+// request buffer size.
 
-
-// NOTE: Receiving multipart/formdata is not currently supported.
+// [2] As of 2022 Dec, receiving multipart/formdata is not supported, and is
+// very low priority. All data must be sent as a binary stream in the body of a
+// request.
 
 /*
  * TODO
  * 
- * 1. Design a good way of organising these files so that they can be searched for on the website
- *    (Database of file names? Maybe. Sounds redundant. May be necessary).
  * 2. For now, this program will load the ENTIRE http request into memory. This drastically limits
  *      the size of requests you can process. This is okay since the size of requests are known
  *      beforehand. (The largest will be running PUT with a PDF file a few dozen KB in length). But
@@ -364,7 +370,7 @@ fn main() {
     
     // Create singletons which will be used throughout the program
     let listener = TcpListener::bind(LOCAL).expect("Could not connect to server");
-    let mut db = Client::connect("postgresql://nate:testpasswd@localhost/rmc", NoTls).unwrap();
+    let mut db = Client::connect(POSTGRES_ADDRESS, NoTls).unwrap();
         
     // Listens for a connection
     for stream in listener.incoming() {
