@@ -1,29 +1,35 @@
-use std::{env, fs};
-use std::fs::File;
-use std::io::{prelude::*, BufReader};
+use std::fs::{File, self};
+use std::io::{prelude::*};
 use std::net::{TcpListener, TcpStream};
-use std::collections::HashMap;
+use std::collections::{HashMap};
 use std::path::Path;
+use std::string::FromUtf8Error;
 use chrono::{Utc, TimeZone, DateTime};
-use chrono_tz::Etc::{GMTMinus4, GMTPlus4};
+use chrono_tz::Etc::{GMTPlus4};
 use compress::zlib;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
-use crate::Body::{Single, MultiPart}; //NOTE: See [2]
+use crate::Body::{Single}; //NOTE: See [2]
 
 // RUST WEBSERVER CONSTANTS
-const REQUEST_BUFFER_SIZE: u16 = 4096; //NOTE: See [1]
-const KB: usize = 1024;
-const MB: usize = KB * 1024;
-const GB: usize = MB * 1024;
+const REQUEST_BUFFER_SIZE: usize = 4096;
 const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const MAX_REQ: usize = (256 * KB) - 1;
-const CR: &[u8] = &[13 as u8];
-const LF: &[u8] = &[10 as u8];
 const PDFS_FILEPATH: &str = r"C:/dev/rmc/site/belgrade/documents/";
 const POSTGRES_ADDRESS: &str = r"postgresql://nate:testpasswd@localhost/rmc";
+const CR: &[u8] = &[13 as u8];
+const LF: &[u8] = &[10 as u8];
+
+// HTTP Response Codes
+const BAD_REQUEST: Response = Response{code:"400 Bad Request", message:None} ;
+const OK: Response = Response{code:"200 OK", message:None};
+const CREATED: Response = Response{code:"201 Created", message:None};
+const ACCEPTED: Response = Response{code:"202 Accepted", message:None};
+const INTERNAL_SERVER_ERROR: Response = Response{code:"500 Internal Server Error", message:None};
+const NOT_IMPLEMENTED: Response = Response{code:"501 Not Implemented", message:None};
+const CONTENT_TOO_LARGE: Response = Response{code:"413 Content Too Large", message:None};
+const LENGTH_REQUIRED: Response = Response{code:"411 Length Required", message:None};
 
 // [1] The current request buffer size is 4KB, the pagesize on the computer I'm
 // running the server on (and most Linux servers as of 2022 Dec). In theory,
@@ -46,7 +52,7 @@ macro_rules! response {
     };
 } 
 
-// Println only in debug
+// println which only appears in debug mode
 #[cfg(debug_assertions)]
 macro_rules! debug_println {
     ($($input:expr),*) => {
@@ -58,13 +64,85 @@ macro_rules! debug_println {
     ($($input:expr),*) => {()}
 }
 
+// Information Needed to Create an HTTP Response
+#[derive(Debug)]
+struct Response {
+    code: &'static str,
+    message: Option<String>,
+}
+
+// This contains information about an HttpLine
+struct LineBuffer {
+    index: usize,
+    size: usize,
+    buffer: [u8; HttpRequest::MAX_LINE_LENGTH],
+}
+
+struct RequestBuffer {
+    index: usize,
+    size: usize,
+    buffer: [u8; REQUEST_BUFFER_SIZE],
+}
+
+impl RequestBuffer {
+    pub fn new() -> RequestBuffer {
+        RequestBuffer { size: 0, index: 0, buffer: [0; REQUEST_BUFFER_SIZE] }
+    }
+
+    // TODO: This function needs review and documentation
+    pub fn fill(&mut self, stream: &mut TcpStream) -> Result<usize, Response> {
+        self.index = 0;
+        let num_bytes_read = stream.read(&mut self.buffer);
+        if let Err(error) = num_bytes_read {
+            return Err(INTERNAL_SERVER_ERROR.clone_with_message(error.to_string()));
+        }
+        let num_bytes_read = num_bytes_read.unwrap();
+        self.size = num_bytes_read;
+        if num_bytes_read == 0 {
+            // TODO: This means the TcpStream is closed. Figure out what to do here.
+            return Ok(num_bytes_read);
+        }
+        return Ok(num_bytes_read);
+    }
+}
+
+// Functions for manipulating repsonses
+impl Response {
+    // Generates an HTTP Response Message
+    fn to_http(&self) -> String {
+        if let Some(message) = &self.message {
+            return format!("HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}\r\n",
+                &self.code, &message.len() + 2, &message // add 2 to account for trailing \r\n
+            );
+        } else {
+            return format!("HTTP/1.1 {}\r\n", &self.code);
+        }
+    }
+
+    // Sends an HTTP Response back to the client
+    fn send(&self, client_stream: &mut TcpStream) {
+        if let Err(error) = client_stream.write(self.to_http().as_bytes()) {
+            println!("ERROR WHEN WRITING RESPONSE: {}", error.to_string());
+        }
+        if let Err(error) = client_stream.flush() {
+            println!("ERROR WHEN SENDING RESPONSE: {}", error.to_string());
+        }   
+        
+    }
+
+    fn clone_with_message(&self, message: String) -> Response {
+        return Response{code: self.code, message: Some(message)};
+    }
+}
+
 // The body of an HTTP request will be stored as either a raw of bytes, or a
 // struct called FormData which is used as the value for a MultiPart enum. More
 // info about FormData can be found in its definition.
 #[derive(Debug)]
 enum Body {
     Single(Vec<u8>), // Raw byte stream. Used when receiving raw data. TODO: This may be able to take a fixed size array instead of a Vector.
-    MultiPart(Vec<FormData>) // Struct with headers. Used when receiving multipart data.
+    MultiPart(Vec<FormData>), // Struct with headers. Used when receiving multipart data.
+    None
 }
 
 // The various types of PDF which are processed
@@ -86,7 +164,8 @@ struct FormData {
 }
 
 // All relevant information in an HttpRequest
-struct HttpRequest {
+#[derive(Debug)]
+struct HttpRequest { 
     method: String,
     location: String,
     version: String,
@@ -94,8 +173,7 @@ struct HttpRequest {
     body: Body // Body is typically stored as a raw byte array
 }
 
-// Create a timezone for Atlantic Standard Time (UTC-4)
-
+// TODO: Create a timezone for Atlantic Standard Time (UTC-4). This will prevent having to import chrono-tz package
 
 // Stores PDF metadata
 #[derive(Debug)]
@@ -148,304 +226,251 @@ impl Body {
 }
 
 impl HttpRequest {
-    // Returns a new HttpRequest struct from a well formatted HttpRequest as
-    // bytes.
-    // FIXME: Function assumes that HTTP requests are properly formed. 
-    // NOTE: 'a is a lifetime indicator. It indicates that the lifetime of all
-    // references with the generic type &'a are linked together. If one variable
-    // is freed, the other will also be freed. (In this case, if
-    // request_as_bytes no longer exists, then the error string will also not
-    // exist).
-    // TODO: I do not enjoy this functionality, but it is necessary (I believe)
-    // in order to use the response! macro to generate responses at compile
-    // time, when in reality, the http response code is not known until runtime.
-    // Before this code goes live, I need to think about this more. This may be
-    // able to be fixed without too much effort by using the ? symbol instead of
-    // .unwrap().
-    fn new<'a>(request_as_bytes: &'a[u8], mut stream: &TcpStream) -> Result<HttpRequest, &'a  str> {
-        // Request line
-        let request_size = request_as_bytes.len();
-        if request_size == 0 {
-            return Err("Http Request received with length 0");
-        }
-        let method_end = u8_index_of(request_as_bytes, b' ', 0, request_size);
-        if let None = method_end {
-            return Err("Could not decode message. May not have been a true HTTP request");
-        }
-        let method_end = method_end.unwrap();
-        let method = String::from_utf8_lossy(&request_as_bytes[..method_end]).into_owned();
+    pub const MAX_LINE_LENGTH: usize = 1024; // The maximum bytes allowed between /r/n sequences (excluding the Body)
+    pub const MAX_HEADERS: usize = 32;
 
-        let location_end = u8_index_of(request_as_bytes, b' ', method_end + 1,  request_size);
-        let request_line_end = u8_index_of(request_as_bytes, b'\r', method_end + 1, request_size)
-            .expect("HTML is malformed");
-        let location: String;
-        let version: String;
-        match location_end {
-            None => {
-                location = String::from_utf8_lossy(&request_as_bytes[method_end+1..request_line_end]).into_owned();
-                version = format!("HTTP/1.0");
-            },
-            Some(location_end) => {
-                location = String::from_utf8_lossy(&request_as_bytes[method_end+1..location_end]).into_owned();
-                version = String::from_utf8_lossy(&request_as_bytes[location_end+1..request_line_end]).into_owned()
-            }
-        }
+    pub fn parse(stream: &mut TcpStream, request_buffer: &mut RequestBuffer) -> Result<HttpRequest, Response> {
+        let mut total_bytes_read: usize = 0;
+        let mut line_buffer = LineBuffer{ index: 0, size: 0, buffer: [0; HttpRequest::MAX_LINE_LENGTH] };
 
+        // Control Data Line
+        total_bytes_read += get_http_line(stream, request_buffer, &mut line_buffer)?;
+        let mut request = parse_control_data_line(&line_buffer)?;
+        
         // Headers
-        let mut header_start = request_line_end + 2;
-        match (version.as_str(), request_as_bytes[header_start] == b'\0') {
-            ("HTTP/1.0", true) => {
-                return Ok(
-                    HttpRequest {
-                        method: method,
-                        location: location,
-                        version: version,
-                        headers: HashMap::new(),
-                        body: Single(Vec::new()),
-                    }
-                );
-            },
-            (_, true) => {
-                return Err("Request malformed. HTTP versions greated that 1.0 must contain a 'Host' header");
-            },
-            (_, false) => ()
-        }
-        let header_end = u8_index_of(request_as_bytes, b'\r', header_start, request_size);
-        if header_end == None {
-            return Err("HTTP request is malformed. Each header must end with CRLF");
-        }
-        let mut header_end = header_end.unwrap();
-        let head_end = u8_index_of_multi(request_as_bytes, b"\r\n\r\n", header_end, request_size)
-            .expect("HTTP request is malformed. Head must end with CRLF CRLF");
-        let mut headers: HashMap<String, String> = HashMap::new();
-        while header_start < head_end {
-            let delim_pos = u8_index_of(request_as_bytes, b':', header_start, header_end)
-                .expect("HTTP request is malformed. Every header must contain a key and a value separated by ':'");
-            let header_key = &request_as_bytes[header_start..delim_pos];
-            let mut header_value = &request_as_bytes[delim_pos+1..header_end]; //TODO: ERROR: This can break if there is no value, because it will save a 0 length byte array
-            while header_value[0] == b' ' {
-                header_value = &header_value[1..];
-            }
-            let header_key = String::from_utf8_lossy(header_key).to_ascii_lowercase();
-            let header_value = String::from_utf8_lossy(header_value).into_owned();
-            headers.insert(header_key, header_value);
+        while let bytes_read = get_http_line(stream, request_buffer, &mut line_buffer)? {
+            if bytes_read == 0 {break;} // 0 length header means body
+            total_bytes_read += bytes_read;
 
-            header_start = header_end + 2;
-            header_end = u8_index_of(request_as_bytes, b'\r', header_start, head_end + 4)
-                .expect("I don't know what went wrong");
-        }
-
-        // Get Body
-        let body_start = head_end + 4;
-        let body_in_buffer = body_start < request_size;
-        let content_length = headers.get("content-length");
-        let content_type = headers.get("content-type");
-        //TODO: The below if statements are disgusting
-        if let Some(content_type) = content_type {
-            if content_type.starts_with("multipart") {
-                return Err("Multipart data is not allowed at this time");
-                /* Not gonna bother implementing multipart rn
-                lazy_static! {
-                    static ref RE_BOUNDARY: Regex = Regex::new("boundary=[\"]?(.*)[\"|;|\r]").unwrap();
-                }
-                let boundary = &RE_BOUNDARY.captures(&content_type).unwrap()[1];
-                let boundary_as_bytes = boundary.as_bytes();
-                let mut body = Vec::new();
-                match (&content_length, &first_byte_of_body) {
-                    (Some(length), b'\0') => {
-                        if let Ok(length) = length.parse::<usize>() {
-                            body.resize(length, b'\0');
-                            let mut reader = BufReader::new(stream);
-                            reader.read_exact(&mut body).unwrap();
-                        } // The sender (client) should be informed of what's going on in the else case here. The request has a content length header that is not made up of entirely numbers
-                    },
-                    // The next two options are caused when there is no Content-Length header. IMO this is undefined behavior, and we should let the client know something is wrong
-                    (None, b'\0') => {
-                        // This may as well be an error
-                        return Ok(HttpRequest{method, location, version, headers, body: MultiPart(Vec::new())})
-                    },
-                    (_, _) => {
-                        body = request_as_bytes[body_start..].to_vec();
-                    }
-                }
-                let mut after_boundary = boundary.len();
-                let forms: Vec<FormData> = Vec::new();
-                while &body[after_boundary..after_boundary+4] != b"--\r\n" {
-
-                }
-                return Ok(HttpRequest{method, location, version, headers, body: MultiPart(Vec::new())})
-                */
-            } else {
-                let mut body = Vec::new();
-                match (content_length, body_in_buffer) {
-                    (Some(length), false) => {
-                        debug_println!("Hopeful path");
-                        if let Ok(length) = length.parse::<usize>() {
-                            body.resize(length, b'\0');
-                            let mut bytes_read = stream.read(&mut body).unwrap(); // A connection can be forcibly closed by the client, at this point the program will crash
-                            debug_println!("bytes_read: {} body len: {}", bytes_read, body.len());
-                            while bytes_read < body.len() { // FIXME: This is bugged. When content is passed in multiple buffer, the second read overwrites the buffer of the first. 
-                                bytes_read += stream.read(&mut body).unwrap();
-                                debug_println!("bytes_read: {} body len: {}", bytes_read, body.len());
-                            }
-                            debug_println!("got here");
-                        } // The sender (client) should be informed of what's going on here. The request has a content length header that is not made up of entirely numbers
-                    },
-                    // The next two options are caused when there is no
-                    // Content-Length header. For now this will be undefined
-                    // behaviour, and the webserver will reject all requests
-                    // without one. The webserver lets the client know that the
-                    // request was invalid.
-                    (None, false) => (),
-                    (_, true) => {
-                        debug_println!("Body was in buffer");
-                        body = request_as_bytes[body_start..].to_vec();
-                    }
-                };
-
-                // Option 1
-                // let mut body: Vec<u8> = Vec::new();
-                // match (&content_length, body_in_buffer) {
-                //     (Some(length), false) => {
-                //         if let Ok(length) = length.parse::<usize>() {
-                //             body.resize(length, b'\0');
-                //             let mut reader = BufReader::new(stream);
-                //             reader.read_exact(&mut body).unwrap();
-                //         } // The sender (client) should be informed of what's going on here. The request has a content length header that is not made up of entirely numbers
-                //     },
-                //     // The next two options are caused when there is no Content-Length header. IMO this is undefined behavior, and we should let the client know something is wrong
-                //     (None, false) => (),
-                //     (_, true) => {
-                //         body = request_as_bytes[body_start..].to_vec();
-                //     }
-                // };
-                
-                return Ok( HttpRequest {method, location, version, headers, body: Single(body)} );
-            }
-        } else {
-            let mut body: Vec<u8> = Vec::new();
-            match (&content_length, body_in_buffer) {
-                (Some(length), _) => {
-                    if let Ok(length) = length.parse::<usize>() {
-                        body.resize(length, b'\0');
-                        let mut reader = BufReader::new(stream);
-                        reader.read_exact(&mut body).unwrap();
-                    } // The sender (client) should be informed of what's going on here. The request has a content length header that is not made up of entirely numbers
-                },
-                // The next two options are caused when there is no Content-Length header. IMO this is undefined behavior, and we should let the client know something is wrong
-                (None, false) => (),
-                (None, true) => {
-                    body = request_as_bytes[body_start..].to_vec();
-                }
-            };
+            // Parse header and append header
+            let (key, value) = parse_header_line(&line_buffer)?;
+            let old_header = request.headers.get_mut(&key);
             
-            return Ok( HttpRequest {method, location, version, headers, body: Single(body)} );
+            if let Some(header) = old_header {
+                header.push_str(", ");
+                header.push_str(&value);
+            } else {
+                request.headers.insert(key, value);
+            }
+
+            // Check if headers over limit
+            if request.headers.len() > HttpRequest::MAX_HEADERS {
+                return Err(CONTENT_TOO_LARGE.clone_with_message(
+                    format!("This server will not accept a request with more than {} headers.", HttpRequest::MAX_HEADERS)
+                ));
+            }
+        }
+
+
+        // Check for body (Require Content-Length header)
+        debug_println!("<== PARSE BODY ==>");
+        debug_println!("Request up to this point: {:?}", request);
+        // Convert content_length into usize
+        let content_length = request.headers.get("Content-Length");
+        if content_length.is_none() {
+            return Ok(request);
+        }
+        let content_length = (*content_length.unwrap()).parse::<usize>();
+        if let Err(error) = content_length {
+            return Err(BAD_REQUEST.clone_with_message("Could not parse the 'Content-Length' header as an integer".to_string()));
+        }
+        let content_length = content_length.unwrap();
+
+        // Create body and read until content_length is reached or error occurs
+        request.body = Single(Vec::with_capacity(content_length));
+        if let Single(body) = &mut request.body { // Not a fan of this syntax here, but I get a mutability error any other way
+            loop {
+                // Append bytes from buffer to body
+                let buffer_bytes = &mut request_buffer.buffer[request_buffer.index..request_buffer.size].to_vec();
+                body.append(buffer_bytes);
+
+                // Fetch for more bytes if not enough
+                if body.len() >= content_length {
+                    break;
+                }
+                if request_buffer.fill(stream)? == 0 {
+                    return Err(BAD_REQUEST.clone_with_message(
+                        format!("Received 'Content-Length: {}', but only read {} bytes", content_length, body.len())
+                    ));
+                }
+            }
+        }
+        
+        debug_println!("Body parsed. Request up to this point: {:?}", request);
+
+        return Ok(request);
+    }
+    
+    fn new(method: String, location: String, version: String) -> HttpRequest {
+        HttpRequest {
+            method: method,
+            location: location,
+            version: version,
+            headers: HashMap::with_capacity(1), // Any HTTP request in HTTP/1.1 and above must have the Host header
+            body: Body::None, // AKA Content
         }
     }
+}
+
+// NOTE: Although http requests are meant to be delimited by CRLF, I think
+// this is stupid. Having a two byte delimiter makes everything more
+// complicated than it needs to be. RFC7230 whic appends section 3.5 of the
+// HTTP protocol states that "we recommend that applications, when parching
+// such headers, recognize a single LF as a line terminator and ignore the
+// leading CR." This is exactly what I will do. This ambiguity may lead to
+// some potential vulnerabilities. A diagram showing the logic  
+fn get_http_line(stream: &mut TcpStream, request_buffer: &mut RequestBuffer, line: &mut LineBuffer) -> Result<usize, Response> {
+    let mut end: usize;
+    line.size = 0;
+    loop {
+        // From the buffer, append all to line until either LF or End of buffer is reached
+        if request_buffer.index >= request_buffer.size {
+            let size = request_buffer.fill(stream)?;
+            debug_println!("==> LOADED BUFFER OF SIZE {}: <==\n{:?}", size, String::from_utf8_lossy(&request_buffer.buffer[0..request_buffer.size]));
+        }
+        let lf_index = (&request_buffer.buffer[request_buffer.index..request_buffer.size]).iter().position(|&x| x == b'\n');
+        end = if let Some(index) = lf_index {index + request_buffer.index} else {request_buffer.size};
+        
+        let length_read = end - request_buffer.index;
+        let new_line_size = line.size + length_read;
+        if new_line_size >= line.buffer.len() {
+            return Err(CONTENT_TOO_LARGE.clone_with_message(
+                format!("Server will not accept a message with a line more than {} bytes long", line.buffer.len())
+            ));
+        }
+
+        // Copy contents to correct place in line buffer
+        line.buffer[line.size..new_line_size].copy_from_slice(&request_buffer.buffer[request_buffer.index..end]);
+        request_buffer.index = end + 1;
+        line.size = new_line_size;
+        
+        // Check for lf and leave, or repeat the process if not
+        if lf_index.is_none() {
+            continue;
+        }
+        if line.size == 0 {
+            return Err(BAD_REQUEST.clone_with_message(
+                "There was a dangling LF (line feed). This is not permitted for this server".to_string()
+            ));            
+            // TODO: There is no reason this should not be continue; instead of a server error, but just for initial testing I'll leave it like this.
+        }
+        let last_byte = line.buffer[line.size - 1];
+        if last_byte != b'\r' {
+            return Err(BAD_REQUEST.clone_with_message(
+                "There was a dangling LF (line feed). This is not permitted for this server".to_string()
+            ));            
+            // TODO: There is no reason this should not be continue; instead of a server error, but just for initial testing I'll leave it like this.
+        }
+
+        // SUCCESS. ALL CHECKS PASSED
+        line.size -= 1; // Don't want the \r in the stream
+        debug_println!("==> LINE READ FROM BUFFER: {:?} <==", String::from_utf8_lossy(&line.buffer[..line.size]));
+        return Ok(line.size);
+    }
+}
+
+fn parse_control_data_line (line_buffer: &LineBuffer) -> Result<HttpRequest, Response> {
+    let line = &line_buffer.buffer[..line_buffer.size];
+    let line = String::from_utf8(line.to_vec());
+    if let Err(FromUtf8Error) = line {
+        return Err(BAD_REQUEST.clone_with_message("Control Line contained not UTF-8 characters".to_string()));
+    }
+    let line = line.unwrap();
+    let values: Vec<&str> = line.split_ascii_whitespace().collect();
+    if values.len() != 3 {
+        return Err(BAD_REQUEST.clone_with_message("Control line was improperly formatted".to_string()));
+    }
+    
+    let method = values[0].to_string();
+    let location = values[1].to_string();
+    if values[2].len() < 6 {
+        return Err(BAD_REQUEST.clone_with_message("HTTP version was improperly formatted".to_string()));
+    }
+    let version = (&values[2][5..]).to_string();
+
+    return Ok(HttpRequest::new(method, location, version));
+}
+
+fn parse_header_line<'a> (line_buffer: &LineBuffer) -> Result<(String, String), Response> {
+    let line = &line_buffer.buffer[..line_buffer.size];
+    let line = String::from_utf8(line.to_vec());
+    if let Err(FromUtf8Error) = line {
+        return Err(BAD_REQUEST.clone_with_message("A header line contained not UTF-8 characters".to_string()));
+    }
+    let line = line.unwrap();
+    let values: Vec<&str> = line.split(": ").collect();
+    if values.len() != 2 {
+        return Err(BAD_REQUEST.clone_with_message("A header line was improperly formatted".to_string()));
+    }
+    return Ok((values[0].to_string(), values[1].to_string()));
 }
 
 // The main loop for the webserver
 fn main() {
-
-    debug_println!("Working Directory: {:?}\nExecutable Directory: {:?}", env::current_dir().unwrap(), env::current_exe().unwrap());
+    debug_println!("--Begin--  PDFs will be stored in: {}", PDFS_FILEPATH);
     
     // Create singletons which will be used throughout the program
-    let listener = TcpListener::bind(LOCAL).expect("Could not connect to server");
-    let mut db = Client::connect(POSTGRES_ADDRESS, NoTls).unwrap();
-        
+    let listener = TcpListener::bind(LOCAL).expect("Aborting: Could not connect to server");
+    let mut db = Client::connect(POSTGRES_ADDRESS, NoTls).unwrap();       
+    let mut request_buffer = RequestBuffer{ size: 0, index: 0, buffer: [0; REQUEST_BUFFER_SIZE] }; 
+    // request_buffer be used for every request. pre-allocating on stack.
+
     // Listens for a connection
     for stream in listener.incoming() {
-        
-        // Max request (for now)
-        let mut raw_request = [b'\0'; MAX_REQ]; // Max request size
+        if let Err(error) = stream {
+            debug_println!("TcpListener had an error when trying to listen for a TcpStream: {}", &error.to_string());
+            continue;
+        }
         let mut stream = stream.unwrap();
-        let request_size = stream.read(&mut raw_request).unwrap();
-        debug_println!("Request size: {}", request_size);
 
-        // FIXME: This part of code will never be reached, since strea.read()
-        // will not overflow the buffer. What really should happen in this whole
-        // program is an attempt at buffered reading. This would also make it so
-        // that the memory footprint would be constant
-        if request_size > MAX_REQ { 
-            stream.write(
-                response!("400 Bad Request", "Http Request is larger than max allowed request (64KB).")
-            ).unwrap();
-            stream.flush().unwrap();
+        let request = HttpRequest::parse(&mut stream, &mut request_buffer);
+        if let Err(response) = request {
+            response.send(&mut stream);
             continue;
-        } 
-
-        let request = HttpRequest::new(&raw_request[..request_size], &stream);
-        if let Err(error) = request {
-            stream.write(response!("400 Bad Request", error)).unwrap();
-            stream.flush().unwrap();
-            continue;
-        } 
+        }
         
         let request = request.unwrap();
-        debug_println!("Body size: {} Headers: {:#?}", request.body.single().unwrap().len(), request.headers);
-        // debug_println!("\nMethod: {:#?}\nLocation: {:#?}\nVersion: {:#?}\nHeaders: {:#?}\nBody: {:?}\n", 
-        //     request.method, request.location, request.version, request.headers, request.body);
-
-        // Parse request
+        let response: Response;
         match request.method.as_str() {
-            "GET" => {
-                let response = handle_get(&request, &mut db);
-                match response {
-                    Ok(success_message) => {
-                        stream.write(response!("200 OK", &success_message));
-                    }
-                    Err(error_message) => {
-                        stream.write(response!("400 Bad Request", &error_message));
-                    }
-                }
-                stream.flush().unwrap();
-                break;
-            }
-            "POST" => {
-                debug_println!("Attemping to process post");
-                if let Err(error) = handle_post(&request, &mut db) {
-                    debug_println!("ERROR IN HANDLING REQUEST: {}", error);
-                    stream.write(response!("400 Bad Request", error));
-                    stream.flush().unwrap();
-                    break;
-                }
-                
-                stream.write( response!("201 Created", "POST Received and Processed")).unwrap()
-            }
-            _=> stream.write(response!("400 Bad Request", [request.method.as_str(), "is not supported yet"].join(" "))).unwrap() 
-        };
-
-        stream.flush().unwrap();
+            "GET"   => response = handle_get(&request, &mut db),
+            "POST"  => response = handle_post(&request, &mut db),
+            _       => response = NOT_IMPLEMENTED,
+        }
+        response.send(&mut stream);
     }
-
-    db.close().unwrap(); 
+    
+    // Should never reach this...
+    if let Err(error) = db.close() {
+        dbg!(error.to_string());
+    }
 }
 
 // Handles a get to belgrade
-fn handle_get(request: &HttpRequest, db: &mut Client) -> Result <String, String> {
+fn handle_get(request: &HttpRequest, db: &mut Client) -> Response {
     // 1. Verify Location [/belgrade/documents(/.*)]
     // 2. 
-    return Ok(format!("placeholder"));
+    return NOT_IMPLEMENTED;
 }
 
 // Handles a POST Http request. This is typically where PDFs are received,
 // analyzed, and sorted into the correct location. Returns a success or error
 // message.
-fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String> {
+fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
     // According to the README, on a POST to /api/belgrade/documents, the
     // webserver is supposed to add a document to the database
     if !request.location.eq("/api/belgrade/documents") {
-        return Err("POSTs can only be made to /api/belgrade/documents".to_owned());
+        return BAD_REQUEST.clone_with_message("POSTs can only be made to /api/belgrade/documents".to_owned());
     }
 
     // NOTE: Assumes that PDF is sent unmodified in Body. Currently, the minimum
     // required metadata for storing a PDF will be the date, customer, and
     // pdf-type (Delivery Ticket or Batch Weight).
     let pdf_as_bytes = request.body.single().unwrap();
-    
+    // let pdf_as_bytes = request.body.unwrap().single().unwrap();
+
     // Confirm that this file is indeed a PDF file
     if !pdf_as_bytes.starts_with(b"%PDF") {
-        return Err("PDF File not detected: The PDF version header was not found".to_owned());
+        return BAD_REQUEST.clone_with_message("PDF File not detected: The PDF version header was not found".to_owned());
     }
 
     // Decide whether Batch Weight or Delivery Ticket or Undecidable.
@@ -485,7 +510,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
     let mut time = String::new();
     let LENGTH_PREFIX = b"<</Length ";
     let mut i = 0;
-    while let Some(flate_header) = u8_index_of_multi(pdf_as_bytes, LENGTH_PREFIX, i, pdf_as_bytes.len()) {
+    while let Some(flate_header) = u8_index_of_multi(pdf_as_bytes.as_slice(), LENGTH_PREFIX, i, pdf_as_bytes.len()) {
         if pdf_type == PDFType::Unknown {break;}
         // Get line which sets up Flate decode and extract the length from it
         let length_start_index = flate_header + LENGTH_PREFIX.len();
@@ -499,7 +524,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         let length = digits.from_digits() as usize;
         let stream_start_index = u8_index_of(&pdf_as_bytes, CR[0], length_end_index, pdf_as_bytes.len());
         if stream_start_index == None {
-            return Err("Could not find the start of the Flate Encoded Stream. Stream should be prefaced by a CRLF pattern, which was not detected. This can occur when the data is not sent as a binary file.".to_owned());
+            return BAD_REQUEST.clone_with_message("Could not find the start of the Flate Encoded Stream. FlateStream should be prefaced by a CRLF pattern, which was not detected. This can occur when the data is not sent as a binary file.".to_string());
         }
         let stream_start_index = stream_start_index.unwrap() + 2; //NOTE: The unwrap is safe, the +2 is not
         let stream_end_index = stream_start_index + length;
@@ -567,7 +592,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         &[&datetime.date_naive(), &(doc_number as i32)] // NOTE: This cast is redundant, but VSCode thinks it is an error without it. Rust does not. It compiles and runs and passes testcases.
     );
     if let Err(e) = result_row {
-        return Err(e.to_string());
+        return INTERNAL_SERVER_ERROR.clone_with_message(e.to_string());
     }
     let result_row = result_row.unwrap();
     let num_entries: i64 = result_row[0].get(0);
@@ -593,7 +618,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
         debug_println!("Prefix: {:?}", prefix);
         fs::create_dir_all(prefix).unwrap();
         let mut pdf_file = File::create(&path_string).unwrap();
-        pdf_file.write_all(pdf_as_bytes).unwrap();
+        pdf_file.write_all(pdf_as_bytes.as_slice()).unwrap();
     }
     
     debug_println!("METADATA: {:#?}", pdf_metadata);
@@ -610,5 +635,5 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Result<String, String>
 
 
     // This is where the PDF should be parsed
-    return Ok("PDF received and stored on server succesfully".to_owned());
+    return CREATED.clone_with_message("PDF received and stored on server succesfully".to_owned());
 }

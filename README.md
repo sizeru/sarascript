@@ -25,3 +25,6 @@ POST | /api/belgrade/documents | Add a document to the database | Y
 # Function Documentaion
 handle_post:
 Handles a POST Http request. This is where the PDF is received as a stream of bytes. The PDF will then be processed and placed into the appropriate file in the appropriate location with the appropriate metadata.
+
+### Approximate speed testing
+Buffers have now been implemented, and are available for various sizes. Though this means nothing, I was able to get ~250 requests per second on a single thread, where each request only had to be processed and a response had to be sent. I will try to get this number higher, I suspect a lot of it has to do with improper pointer usage (passing by value when I should be passing by reference). Though this performance isn't great, I am happy to have a good start.
