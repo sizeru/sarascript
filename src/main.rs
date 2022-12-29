@@ -16,7 +16,7 @@ const REQUEST_BUFFER_SIZE: usize = 4096;
 const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const PDFS_FILEPATH: &str = r"C:/dev/rmc/site/belgrade/documents/";
+const PDFS_FILEPATH: &str = r"/home/nate/rmc/pdfs";
 const POSTGRES_ADDRESS: &str = r"postgresql://nate:testpasswd@localhost/rmc";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
@@ -232,6 +232,7 @@ impl HttpRequest {
     pub fn parse(stream: &mut TcpStream, request_buffer: &mut RequestBuffer) -> Result<HttpRequest, Response> {
         let mut total_bytes_read: usize = 0;
         let mut line_buffer = LineBuffer{ index: 0, size: 0, buffer: [0; HttpRequest::MAX_LINE_LENGTH] };
+        request_buffer.size = 0;
 
         // Control Data Line
         total_bytes_read += get_http_line(stream, request_buffer, &mut line_buffer)?;
@@ -350,7 +351,7 @@ fn get_http_line(stream: &mut TcpStream, request_buffer: &mut RequestBuffer, lin
         }
         if line.size == 0 {
             return Err(BAD_REQUEST.clone_with_message(
-                "There was a dangling LF (line feed). This is not permitted for this server".to_string()
+                "A line contains only a single line feed. This is not allowed on this server".to_string()
             ));            
             // TODO: There is no reason this should not be continue; instead of a server error, but just for initial testing I'll leave it like this.
         }
@@ -431,6 +432,7 @@ fn main() {
         
         let request = request.unwrap();
         let response: Response;
+        debug_println!("Processing complete. Dispatching request");
         match request.method.as_str() {
             "GET"   => response = handle_get(&request, &mut db),
             "POST"  => response = handle_post(&request, &mut db),
