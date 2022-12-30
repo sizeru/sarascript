@@ -19,11 +19,12 @@ const REQUEST_BUFFER_SIZE: usize = 4096;
 const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const PDFS_FILEPATH: &str = r"/home/nate/rmc/pdfs";
-const POSTGRES_ADDRESS: &str = r"postgresql://nate:testpasswd@localhost/rmc";
+const PDFS_FILEPATH: &str = "/home/nate/code/rmc/site/belgrade/documents/";
+const POSTGRES_ADDRESS: &str = "postgresql://nate:testpasswd@localhost/rmc";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
-// /belgrade/documents/search?
+// const ROOT_DIR: &str = "https://redimixdominica.com/belgrade/documents/";
+
 
 // HTTP Response Codes
 const BAD_REQUEST: Response = Response{code:"400 Bad Request", message:None} ;
@@ -538,7 +539,7 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     debug_println!("Query: {} Filter: {} Processed datetimes --- From: {:?} To: {:?}", query, filter, from_datetime, to_datetime);
     
     // Everything has been extracted and processed. Ready for database query
-    const BASE_REQUEST: &str = "SELECT pdf_datetime, pdf_type, pdf_num, customer FROM pdfs WHERE pdf_datetime BETWEEN $1 AND $2";
+    const BASE_REQUEST: &str = "SELECT pdf_datetime, pdf_type, pdf_num, customer, relative_path FROM pdfs WHERE pdf_datetime BETWEEN $1 AND $2";
     let full_query = match filter.as_str() {
         "Customer" => {
             format!("{} AND customer ILIKE '%{}%';", BASE_REQUEST, query)
@@ -554,19 +555,30 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
         }
     };
     
+    // Execute query
     debug_println!("Query to be executed: {}", full_query);
-    // Execute query and generate 
     let rows = db.query(&full_query, &[&from_datetime, &to_datetime]);
     if let Err(error) = rows { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not execute query on database: {}", error.to_string())); }
     let rows = rows.unwrap();
+    
+    // Create HTML table in response
+    let mut table = "<table><tr><th>DateTime</th><th>Type</th><th>Num</th><th>Customer</th><th>Link</th></tr>".to_string();
+
     for row in rows {
         let datetime: DateTime<Utc> = row.get(0);
         let pdf_type: i32 = row.get(1);
         let pdf_num: i32 = row.get(2);
         let customer: &str = row.get(3);
-        debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {}", datetime, pdf_type, pdf_num, customer);
-    }
+        let relative_path: &str = row.get(4);
+        debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {} Path: {}", datetime, pdf_type, pdf_num, customer, relative_path);
 
+        let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}{}\">Link</a></td></tr>",
+                datetime.format("%Y-%b-%d %I:%M %p").to_string(), pdf_type, pdf_num, customer, PDFS_FILEPATH, relative_path);
+        table.push_str(&table_row);
+        // Generate HTML
+    }
+    table.push_str("</table>");
+    debug_println!("{}", table);
     return NOT_IMPLEMENTED;
 }
 

@@ -149,6 +149,7 @@ a {
 }
 
 table {
+    margin-top: 30px;
     width: 100%;
     border-collapse: collapse;
     font-family: 'Trebuchet MS', 'Lucida Sans Unicode', 'Lucida Grande', 'Lucida Sans', Arial, sans-serif;
