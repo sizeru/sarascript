@@ -39,6 +39,10 @@ p, text {
     font-size: 1.3rem;
 }
 
+a {
+    color: var(--dark_link);
+}
+
 .button_line {
     background-color: var(--dark_highlight);
     border-radius: var(--border-radius);
@@ -142,4 +146,24 @@ p, text {
     text-align: center;
     vertical-align: middle;
     width: 40px; /* Constant so divider line can be in middle */
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: 'Trebuchet MS', 'Lucida Sans Unicode', 'Lucida Grande', 'Lucida Sans', Arial, sans-serif;
+    color: var(--dark_text);
+}
+
+table th, table td {
+    border: 1px solid var(--dark_text);
+    padding: 6px 15px;
+}
+
+table tr:nth-child(even) {
+    background-color: var(--dark_disencouraged);
+}
+
+table th {
+    background-color: var(--dark_highlight);
 }
