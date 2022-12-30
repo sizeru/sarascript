@@ -1,14 +1,17 @@
 use std::fs::{File, self};
+use std::hash::Hash;
 use std::io::{prelude::*};
 use std::net::{TcpListener, TcpStream};
 use std::collections::{HashMap};
 use std::path::Path;
 use std::string::FromUtf8Error;
-use chrono::{Utc, TimeZone, DateTime};
+use chrono::{Utc, TimeZone, DateTime, Date, Duration};
+use chrono_tz::Asia::Vladivostok;
 use chrono_tz::Etc::{GMTPlus4};
 use compress::zlib;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
+use urlencoding::encode;
 use crate::Body::{Single}; //NOTE: See [2]
 
 // RUST WEBSERVER CONSTANTS
@@ -20,6 +23,7 @@ const PDFS_FILEPATH: &str = r"/home/nate/rmc/pdfs";
 const POSTGRES_ADDRESS: &str = r"postgresql://nate:testpasswd@localhost/rmc";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
+// /belgrade/documents/search?
 
 // HTTP Response Codes
 const BAD_REQUEST: Response = Response{code:"400 Bad Request", message:None} ;
@@ -168,6 +172,7 @@ struct FormData {
 struct HttpRequest { 
     method: String,
     location: String,
+    query: HashMap<String, String>,
     version: String,
     headers: HashMap<String, String>,
     body: Body // Body is typically stored as a raw byte array
@@ -265,7 +270,7 @@ impl HttpRequest {
 
         // Check for body (Require Content-Length header)
         debug_println!("<== PARSE BODY ==>");
-        debug_println!("Request up to this point: {:?}", request);
+        debug_println!("Request up to this point: {:#?}", request);
         // Convert content_length into usize
         let content_length = request.headers.get("Content-Length");
         if content_length.is_none() {
@@ -302,10 +307,11 @@ impl HttpRequest {
         return Ok(request);
     }
     
-    fn new(method: String, location: String, version: String) -> HttpRequest {
+    fn new(method: String, location: String, query: HashMap<String, String>, version: String) -> HttpRequest {
         HttpRequest {
             method: method,
             location: location,
+            query: query,
             version: version,
             headers: HashMap::with_capacity(1), // Any HTTP request in HTTP/1.1 and above must have the Host header
             body: Body::None, // AKA Content
@@ -383,13 +389,38 @@ fn parse_control_data_line (line_buffer: &LineBuffer) -> Result<HttpRequest, Res
     }
     
     let method = values[0].to_string();
-    let location = values[1].to_string();
+    let (location, query) = parse_location(&values[1].to_string())?;
     if values[2].len() < 6 {
         return Err(BAD_REQUEST.clone_with_message("HTTP version was improperly formatted".to_string()));
     }
     let version = (&values[2][5..]).to_string();
 
-    return Ok(HttpRequest::new(method, location, version));
+    return Ok(HttpRequest::new(method, location, query, version));
+}
+
+fn parse_location(location_line: &String) -> Result<(String, HashMap<String, String>), Response> {
+    let values: Vec<&str> = location_line.split("?").collect();
+    let location = values[0].to_string();
+    let mut queries: HashMap<String, String> = HashMap::new();
+    match values.len() {
+        1 => {
+            return Ok((location, queries));
+        }
+        2 => {/* break */}
+        _ => {
+            return Err(BAD_REQUEST.clone_with_message("Cannot have more than two '?' characters in a URL".to_string()));
+        }
+    }
+
+    let pairs: Vec<&str> = values[1].split("&").collect();
+    for pair in pairs {
+        let value: Vec<&str> = pair.split("=").collect();
+        if value.len() == 1 {
+            continue;
+        }
+        queries.insert(value[0].to_string(), value[1].to_string());
+    }
+    return Ok((location, queries));
 }
 
 fn parse_header_line<'a> (line_buffer: &LineBuffer) -> Result<(String, String), Response> {
@@ -433,11 +464,12 @@ fn main() {
         let request = request.unwrap();
         let response: Response;
         debug_println!("Processing complete. Dispatching request");
-        match request.method.as_str() {
-            "GET"   => response = handle_get(&request, &mut db),
-            "POST"  => response = handle_post(&request, &mut db),
-            _       => response = NOT_IMPLEMENTED,
-        }
+        let response: Response = match (request.method.as_str(), request.location.as_str()) {
+            ("GET", "/belgrade/documents/search")   => handle_query(&request, &mut db),
+            ("GET", _)                              => handle_get(&request, &mut db),
+            ("POST", "/api/belgrade/documents")     => handle_post(&request, &mut db),
+            _                                       => NOT_IMPLEMENTED,
+        };
         response.send(&mut stream);
     }
     
@@ -447,11 +479,102 @@ fn main() {
     }
 }
 
+// Handles an http query to the database
+fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
+    // Ensure all fields are present and decoded. Set defaults for empty strings
+    let query = request.query.get("query");
+    if query.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'query' field".to_string());}
+    let query = query.unwrap();
+    let query = urlencoding::decode(query);
+    if let Err(error) = query { return BAD_REQUEST.clone_with_message(format!("Could not decode query into UTF-8: {}", error.to_string())); }
+    let query = query.unwrap().into_owned();
+    if query.contains("\"") { return BAD_REQUEST.clone_with_message("queries cannot have the \" character in them.".to_string()); }
+
+    let filter = request.query.get("filter");
+    if filter.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'filter' field".to_string());}
+    let filter = filter.unwrap();
+    let filter = urlencoding::decode(filter);
+    if let Err(error) = filter { return BAD_REQUEST.clone_with_message(format!("Could not decode filter into UTF-8: {}", error.to_string())); }
+    let filter = filter.unwrap().into_owned();
+    if filter.contains("\"") { return BAD_REQUEST.clone_with_message("filters cannot have the \" character in them.".to_string()); }
+
+    let from = request.query.get("from");
+    if from.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'from' field".to_string());}
+    let from = from.unwrap();
+    let from_datetime: DateTime<Utc>;
+    if from.is_empty() {
+        let thirty_days_ago = Utc::now().checked_sub_days(chrono::Days::new(30));
+        if let Some(datetime) = thirty_days_ago {
+            from_datetime = datetime;
+        } else {
+            return INTERNAL_SERVER_ERROR.clone_with_message("Server was unable to process 'from' datetime".to_string()); // Is this even possible?
+        }
+    } else {
+        let datetime = GMTPlus4.datetime_from_str(&format!("{} 00:00:00", from), "%Y-%m-%d %H:%M:%S");
+        match datetime {
+            Ok(datetime) => from_datetime = datetime.with_timezone(&Utc),
+            Err(error) => return BAD_REQUEST.clone_with_message(format!("'from' date was improperly formatted: {}", error.to_string())),
+        }
+    }
+
+    let to = request.query.get("to");
+    if to.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'to' field".to_string());}
+    let to = to.unwrap();
+    let to_datetime: DateTime<Utc>;
+    if to.is_empty() {
+        to_datetime = Utc::now();
+    } else {
+        let datetime = GMTPlus4.datetime_from_str(&format!("{} 23:59:59", to), "%Y-%m-%d %H:%M:%S");
+        match datetime {
+            Ok(datetime) => to_datetime = datetime.with_timezone(&Utc),
+            Err(error) => return BAD_REQUEST.clone_with_message(format!("'to' date was improperly formatted: {}", error.to_string())),
+        }
+    }
+
+    if to_datetime < from_datetime {
+        return BAD_REQUEST.clone_with_message("The 'from' is sooner than the 'to' date, or the from date does not exist".to_string());
+    }
+
+    debug_println!("Query: {} Filter: {} Processed datetimes --- From: {:?} To: {:?}", query, filter, from_datetime, to_datetime);
+    
+    // Everything has been extracted and processed. Ready for database query
+    const BASE_REQUEST: &str = "SELECT pdf_datetime, pdf_type, pdf_num, customer FROM pdfs WHERE pdf_datetime BETWEEN $1 AND $2";
+    let full_query = match filter.as_str() {
+        "Customer" => {
+            format!("{} AND customer ILIKE '%{}%';", BASE_REQUEST, query)
+        }
+        "Delivery Ticket #" => {
+            format!("{} AND pdf_type = 2 AND pdf_num = {};", BASE_REQUEST, query)
+        },
+        "Batch Weight #" => {
+            format!("{} AND pdf_type = 1 AND pdf_num = {};", BASE_REQUEST, query)
+        },
+        _ => { 
+            format!("{} AND relative_path ILIKE '%{}%';", BASE_REQUEST, query)
+        }
+    };
+    
+    debug_println!("Query to be executed: {}", full_query);
+    // Execute query and generate 
+    let rows = db.query(&full_query, &[&from_datetime, &to_datetime]);
+    if let Err(error) = rows { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not execute query on database: {}", error.to_string())); }
+    let rows = rows.unwrap();
+    for row in rows {
+        let datetime: DateTime<Utc> = row.get(0);
+        let pdf_type: i32 = row.get(1);
+        let pdf_num: i32 = row.get(2);
+        let customer: &str = row.get(3);
+        debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {}", datetime, pdf_type, pdf_num, customer);
+    }
+
+    return NOT_IMPLEMENTED;
+}
+
 // Handles a get to belgrade
 fn handle_get(request: &HttpRequest, db: &mut Client) -> Response {
     // 1. Verify Location [/belgrade/documents(/.*)]
     // 2. 
-    return NOT_IMPLEMENTED;
+    return OK;
 }
 
 // Handles a POST Http request. This is typically where PDFs are received,
