@@ -19,7 +19,7 @@ const REQUEST_BUFFER_SIZE: usize = 4096;
 const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const PDFS_FILEPATH: &str = "/home/nate/code/rmc/site/belgrade/documents/";
+const ROOT_DIR: &str ="/home/nate/code/rmc/site";
 const POSTGRES_ADDRESS: &str = "postgresql://nate:testpasswd@localhost/rmc";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
@@ -113,11 +113,12 @@ impl RequestBuffer {
 
 // Functions for manipulating repsonses
 impl Response {
+
     // Generates an HTTP Response Message
-    fn to_http(&self) -> String {
+    fn to_http(&self, content_type: &str) -> String {
         if let Some(message) = &self.message {
-            return format!("HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}\r\n",
-                &self.code, &message.len() + 2, &message // add 2 to account for trailing \r\n
+            return format!("HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n{}\r\n",
+                &self.code, &message.len() + 2, content_type, &message // add 2 to account for trailing \r\n
             );
         } else {
             return format!("HTTP/1.1 {}\r\n", &self.code);
@@ -125,8 +126,8 @@ impl Response {
     }
 
     // Sends an HTTP Response back to the client
-    fn send(&self, client_stream: &mut TcpStream) {
-        if let Err(error) = client_stream.write(self.to_http().as_bytes()) {
+    fn send(&self, client_stream: &mut TcpStream, content_type: &str) {
+        if let Err(error) = client_stream.write(self.to_http(content_type).as_bytes()) {
             println!("ERROR WHEN WRITING RESPONSE: {}", error.to_string());
         }
         if let Err(error) = client_stream.flush() {
@@ -440,7 +441,7 @@ fn parse_header_line<'a> (line_buffer: &LineBuffer) -> Result<(String, String), 
 
 // The main loop for the webserver
 fn main() {
-    debug_println!("--Begin--  PDFs will be stored in: {}", PDFS_FILEPATH);
+    debug_println!("--Begin--  Root dir is set at: {}", ROOT_DIR);
     
     // Create singletons which will be used throughout the program
     let listener = TcpListener::bind(LOCAL).expect("Aborting: Could not connect to server");
@@ -458,7 +459,8 @@ fn main() {
 
         let request = HttpRequest::parse(&mut stream, &mut request_buffer);
         if let Err(response) = request {
-            response.send(&mut stream);
+
+            response.send(&mut stream, "text/plain");
             continue;
         }
         
@@ -467,17 +469,33 @@ fn main() {
         debug_println!("Processing complete. Dispatching request");
         let response: Response = match (request.method.as_str(), request.location.as_str()) {
             ("GET", "/belgrade/documents/search")   => handle_query(&request, &mut db),
+            ("GET", "/styles.css")                  => handle_styles(&request),
             ("GET", _)                              => handle_get(&request, &mut db),
             ("POST", "/api/belgrade/documents")     => handle_post(&request, &mut db),
             _                                       => NOT_IMPLEMENTED,
         };
-        response.send(&mut stream);
+        match request.location.as_str() {
+            ("/styles.css")                 => response.send(&mut stream, "text/css"),
+            ("/belgrade/documents/search")  => response.send(&mut stream, "text/html"),
+            _                               => response.send(&mut stream, "text/plain"),
+        }
     }
     
     // Should never reach this...
     if let Err(error) = db.close() {
         dbg!(error.to_string());
     }
+}
+
+// Returns the stylesheet
+fn handle_styles (request: &HttpRequest) -> Response {
+    let mut stylesheet: Vec<u8> = vec![0; 4096];
+    let mut file = File::open(format!("{}/styles.css", ROOT_DIR));
+    if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message("Could not open the styles.css file".to_owned()); }
+    let mut file = file.unwrap();
+    let bytes_read = file.read(&mut stylesheet);
+    if let Err(error) = bytes_read {return INTERNAL_SERVER_ERROR.clone_with_message("Could not read from the index.html file".to_owned()); }
+    return OK.clone_with_message(String::from_utf8(stylesheet).unwrap());
 }
 
 // Handles an http query to the database
@@ -562,24 +580,47 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     let rows = rows.unwrap();
     
     // Create HTML table in response
-    let mut table = "<table><tr><th>DateTime</th><th>Type</th><th>Num</th><th>Customer</th><th>Link</th></tr>".to_string();
-
+    let entries = rows.len();
+    let mut table = format!("<p>Found {} entries</p><table><tr><th>DateTime</th><th>Type</th><th>Num</th><th>Customer</th><th>Link</th></tr>", entries);
     for row in rows {
         let datetime: DateTime<Utc> = row.get(0);
         let pdf_type: i32 = row.get(1);
+        let pdf_type = match pdf_type {
+            1 => {"BW"},
+            2 => {"DT"},
+            _ => {"N/A"},
+        };
         let pdf_num: i32 = row.get(2);
         let customer: &str = row.get(3);
         let relative_path: &str = row.get(4);
-        debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {} Path: {}", datetime, pdf_type, pdf_num, customer, relative_path);
+        // debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {} Path: {}", datetime, pdf_type, pdf_num, customer, relative_path);
 
-        let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}{}\">Link</a></td></tr>",
-                datetime.format("%Y-%b-%d %I:%M %p").to_string(), pdf_type, pdf_num, customer, PDFS_FILEPATH, relative_path);
+        let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}/belgrade/documents/{}\">Link</a></td></tr>",
+                datetime.format("%Y-%b-%d %I:%M %p").to_string(), pdf_type, pdf_num, customer, ROOT_DIR, relative_path);
         table.push_str(&table_row);
-        // Generate HTML
     }
     table.push_str("</table>");
-    debug_println!("{}", table);
-    return NOT_IMPLEMENTED;
+
+    // Read from source html file and return appended file to client
+    let mut index: Vec<u8> = vec![0;2048];
+    let mut file = File::open(format!("{}/belgrade/documents/index.html", ROOT_DIR));
+    if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message("Could not open the index.html file".to_owned()); }
+    let mut file = file.unwrap();
+    let bytes_read = file.read(&mut index);
+    if let Err(error) = bytes_read {return INTERNAL_SERVER_ERROR.clone_with_message("Could not read from the index.html file".to_owned()); }
+    let bytes_read = bytes_read.unwrap();
+    let end = index.windows(7).position(|x| x == b"</form>");
+    if end.is_none() {return INTERNAL_SERVER_ERROR.clone_with_message("Could not parse the server's own index.html file".to_string()); }
+    let mut end = end.unwrap();
+    end += 7;
+
+    // Overwrite
+    let mut table = table.as_bytes().to_vec();
+    let mut index = index[..end].to_vec();
+    index.append(&mut table);
+    index.append(&mut b"</body>".to_vec());
+
+    return OK.clone_with_message(String::from_utf8(index).unwrap());
 }
 
 // Handles a get to belgrade
@@ -749,7 +790,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
     
     // Place the PDF file into the correct place into the filesystem
     {
-        let path_string = format!("{}{}", PDFS_FILEPATH, &pdf_metadata.relative_path);
+        let path_string = format!("{}{}{}", ROOT_DIR, "/belgrade/documents/", &pdf_metadata.relative_path);
         let path = Path::new(&path_string);
         let prefix = path.parent().unwrap(); // path without final component
         debug_println!("Prefix: {:?}", prefix);

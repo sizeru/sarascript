@@ -92,12 +92,6 @@ a {
     height: 37px;
 }
 
-.vl {
-    margin: none;
-    padding: none;
-    border-left: 2px solid var(--dark_text);
-}
-
 .search-bar select {
     flex: 0.4;
     background: transparent;
