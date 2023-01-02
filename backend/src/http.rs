@@ -188,7 +188,7 @@ impl HttpRequest {
         let content_length = request.headers.get("Content-Length");
         if content_length.is_none() {
             #[cfg(feature = "echo-test")]
-            if request.location.as_str() == "/api/echo" {
+            if request.location.starts_with("/api/echo") {
                 return Err(OK.clone_with_message(format!("{:#?}", request)));
             }
             return Ok(request);
@@ -221,7 +221,7 @@ impl HttpRequest {
         debug_println!("Body parsed. Request up to this point: {:?}", request);
 
         #[cfg(feature = "echo-test")]
-        if request.location.as_str() == "/api/echo" {
+        if request.location.starts_with("/api/echo") {
             return Err(OK.clone_with_message(format!("{:#?}", request)));
         }
 
@@ -322,6 +322,10 @@ fn parse_control_data_line (line_buffer: &LineBuffer) -> Result<HttpRequest, Res
 fn parse_location(location_line: &String) -> Result<(String, HashMap<String, String>), Response> {
     let values: Vec<&str> = location_line.split("?").collect();
     let location = values[0].to_string();
+    let location = urlencoding::decode(&location);
+    if let Err(error) = location { return Err(BAD_REQUEST.clone_with_message(format!("The location in the url could not be decoded: {}", error.to_string()))); }
+    let location = location.unwrap().into_owned();
+
     let mut queries: HashMap<String, String> = HashMap::new();
     match values.len() {
         1 => {
