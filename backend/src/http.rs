@@ -1,17 +1,6 @@
-use std::fs::{File, self};
-use std::hash::Hash;
 use std::io::{prelude::*};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::collections::{HashMap};
-use std::path::Path;
-use std::string::FromUtf8Error;
-use chrono::{Utc, TimeZone, DateTime, Date, Duration};
-use chrono_tz::Asia::Vladivostok;
-use chrono_tz::Etc::{GMTPlus4};
-use compress::zlib;
-use num_digitize::FromDigits;
-use postgres::{Client, NoTls};
-use urlencoding::encode;
 use crate::Body::{Single}; //NOTE: See [2]
 
 // HTTP Response Codes
@@ -26,13 +15,6 @@ pub const LENGTH_REQUIRED: Response = Response{code:"411 Length Required", messa
 
 // RUST WEBSERVER CONSTANTS
 const REQUEST_BUFFER_SIZE: usize = 4096;
-const LOCAL: &str = "127.0.0.1:7878";
-const IPV4: &str = "45.77.158.123:7878";
-const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const ROOT_DIR: &str ="/home/nate/code/rmc/site";
-const POSTGRES_ADDRESS: &str = "postgresql://nate:testpasswd@localhost/rmc";
-const CR: &[u8] = &[13 as u8];
-const LF: &[u8] = &[10 as u8];
 
 // println which only appears in debug mode
 #[cfg(debug_assertions)]
@@ -205,6 +187,10 @@ impl HttpRequest {
         // Convert content_length into usize
         let content_length = request.headers.get("Content-Length");
         if content_length.is_none() {
+            #[cfg(feature = "echo-test")]
+            if request.location.as_str() == "/api/echo" {
+                return Err(OK.clone_with_message(format!("{:#?}", request)));
+            }
             return Ok(request);
         }
         let content_length = (*content_length.unwrap()).parse::<usize>();
@@ -232,8 +218,12 @@ impl HttpRequest {
                 }
             }
         }
-        
         debug_println!("Body parsed. Request up to this point: {:?}", request);
+
+        #[cfg(feature = "echo-test")]
+        if request.location.as_str() == "/api/echo" {
+            return Err(OK.clone_with_message(format!("{:#?}", request)));
+        }
 
         return Ok(request);
     }

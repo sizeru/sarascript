@@ -5,6 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+echo-test = []
+
 [dependencies]
 chrono = "0.4.23"
 chrono-tz = "0.8.1"

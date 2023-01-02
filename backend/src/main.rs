@@ -1,20 +1,14 @@
 use std::fs::{File, self};
-use std::hash::Hash;
 use std::io::{prelude::*};
-use std::net::{TcpListener, TcpStream};
-use std::collections::{HashMap};
+use std::net::TcpListener;
 use std::path::Path;
-use std::string::FromUtf8Error;
-use chrono::{Utc, TimeZone, DateTime, Date, Duration};
-use chrono_tz::Asia::Vladivostok;
-use chrono_tz::Etc::{GMTPlus4};
+use chrono::{Utc, TimeZone, DateTime};
+use chrono_tz::Etc::GMTPlus4;
 use compress::zlib;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
-use urlencoding::encode;
 mod http;
 use crate::http::*;
-use crate::http::Body::{Single}; //NOTE: See [2]
 
 
 // RUST WEBSERVER CONSTANTS
@@ -112,7 +106,7 @@ fn main() {
     // Create singletons which will be used throughout the program
     let listener = TcpListener::bind(LOCAL).expect("Aborting: Could not connect to server");
     let mut db = Client::connect(POSTGRES_ADDRESS, NoTls).unwrap();       
-    let mut request_buffer = RequestBuffer{ size: 0, index: 0, buffer: [0; REQUEST_BUFFER_SIZE] }; 
+    let mut request_buffer = RequestBuffer::new(); 
     // request_buffer be used for every request. pre-allocating on stack.
 
     // Listens for a connection
@@ -125,7 +119,6 @@ fn main() {
 
         let request = HttpRequest::parse(&mut stream, &mut request_buffer);
         if let Err(response) = request {
-
             response.send(&mut stream, "text/plain");
             continue;
         }

@@ -1,0 +1,12 @@
+#!/bin/bash
+HOST=127.0.0.1:7878
+
+# Test the basic functionality of the server
+curl -i $HOST 
+# HTTP/1.1 501 Not Implemented
+curl -i "$HOST?first=second&third=fourth"
+# HTTP/1.1 501 Not Implemented
+
+# Tests with bodies
+
+#TODO Need more tests

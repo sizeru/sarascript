@@ -1,2 +1,6 @@
-/target
+backend/target
 /.vscode
+data
+backend/tests
+belgrade/documents/*
+belgrade/reports/*
