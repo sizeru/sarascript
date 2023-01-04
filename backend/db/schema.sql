@@ -2,10 +2,11 @@
 
 CREATE TABLE IF NOT EXISTS pdfs (
     id              SERIAL PRIMARY KEY,
-    pdf_type        INTEGER NOT NULL,
-    pdf_num         INTEGER,
+    pdf_type        INT4,
+    pdf_num         INT4,
     pdf_datetime    TIMESTAMP WITH TIME ZONE,
-    customer        VARCHAR ( 50 ),
-    relative_path   VARCHAR ( 60 )
+    customer        VARCHAR ( 150 ),
+    relative_path   VARCHAR ( 200 ),
+    crc32_checksum  INT4
     -- other vars come here eventually
 );

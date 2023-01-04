@@ -218,7 +218,7 @@ impl HttpRequest {
                 }
             }
         }
-        debug_println!("Body parsed. Request up to this point: {:?}", request);
+        // debug_println!("Body parsed. Request up to this point: {:?}", request);
 
         #[cfg(feature = "echo-test")]
         if request.location.starts_with("/api/echo") {

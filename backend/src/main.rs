@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{File, self};
 use std::io::{prelude::*};
 use std::net::TcpListener;
@@ -5,6 +6,7 @@ use std::path::Path;
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::GMTPlus4;
 use compress::zlib;
+use crc::Crc;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
 mod http;
@@ -67,6 +69,7 @@ struct PDFMetadata {
     customer: String,
     relative_path: String,
     doc_number: i32,
+    crc32_checksum: u32,
 }
 
 // Finds the index of the first predicate (the byte to be searched for) in an
@@ -128,8 +131,9 @@ fn main() {
         debug_println!("Processing complete. Dispatching request");
         let response: Response = match (request.method.as_str(), request.location.as_str()) {
             ("GET", "/belgrade/documents/search")   => handle_query(&request, &mut db),
-            ("GET", "/styles.css")                  => handle_styles(&request),
+            ("GET", "/styles.css")                  => handle_styles(),
             ("GET", "/belgrade/documents/"_)        => get_document_search(&request),
+            ("GET", "/api/belgrade/documents/exists") => document_exists(&request.query, &mut db),
             ("POST", "/api/belgrade/documents")     => handle_post(&request, &mut db),
             _                                       => NOT_IMPLEMENTED,
         };
@@ -147,14 +151,28 @@ fn main() {
 }
 
 // Returns the stylesheet
-fn handle_styles (request: &HttpRequest) -> Response {
+fn handle_styles () -> Response {
     let mut stylesheet: Vec<u8> = vec![0; 4096];
-    let mut file = File::open(format!("{}/styles.css", ROOT_DIR));
-    if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message("Could not open the styles.css file".to_owned()); }
+    let file = File::open(format!("{}/styles.css", ROOT_DIR));
+    if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not open the styles.css file: {}", error.to_string())); }
     let mut file = file.unwrap();
     let bytes_read = file.read(&mut stylesheet);
-    if let Err(error) = bytes_read {return INTERNAL_SERVER_ERROR.clone_with_message("Could not read from the index.html file".to_owned()); }
+    if let Err(error) = bytes_read {return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not read from the index.html file: {}", error.to_string())); }
     return OK.clone_with_message(String::from_utf8(stylesheet).unwrap());
+}
+
+// Returns whether a document exists in the database
+fn document_exists(queries: &HashMap<String, String>, db: &mut Client) -> Response {
+    // Verify the appropriate queries exist
+    if !queries.contains_key("crc32") { return BAD_REQUEST.clone_with_message("This request requires a crc32 query".to_string()); }
+    if !queries.contains_key("type") { return BAD_REQUEST.clone_with_message("This request requires a type query".to_string()); }
+    if !queries.contains_key("num") { return BAD_REQUEST.clone_with_message("This request requires a num query".to_string()); }
+    let row = db.query_one(&format!("SELECT COUNT(*) FROM pdfs WHERE pdf_type = {} AND pdf_num = {} AND crc32_checksum = {};",
+            queries.get("type").unwrap(), queries.get("num").unwrap(), queries.get("crc32").unwrap()),&[]);
+    if let Err(error) = row { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not execute the document exists query on the database. Error: {}", error.to_string())); }
+    let row = row.unwrap();
+    let document_count: i64 = row.get(0);
+    return OK.clone_with_message(document_count.to_string());
 }
 
 // Handles an http query to the database
@@ -298,12 +316,6 @@ fn get_document_search(request: &HttpRequest) -> Response {
 // analyzed, and sorted into the correct location. Returns a success or error
 // message.
 fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
-    // According to the README, on a POST to /api/belgrade/documents, the
-    // webserver is supposed to add a document to the database
-    if !request.location.eq("/api/belgrade/documents") {
-        return BAD_REQUEST.clone_with_message("POSTs can only be made to /api/belgrade/documents".to_owned());
-    }
-
     // NOTE: Assumes that PDF is sent unmodified in Body. Currently, the minimum
     // required metadata for storing a PDF will be the date, customer, and
     // pdf-type (Delivery Ticket or Batch Weight).
@@ -339,13 +351,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
         }
     } 
 
-    // Deflate and retrieve date and customer. FIXME: This currently breaks when
-    // ticket requests are received to quickly. I am not sure why this may
-    // occur, but I believe this may be because when testing with curl, there is
-    // an attempt to have a keep alive or something when rapidly sending large
-    // requests, and this is not implemented. More research needs to be done,
-    // but this won't be a problem so long as the server responds saying that
-    // the request did not go through. 
+    // Deflate and retrieve date and customer.
     let mut date = String::new();
     let mut customer = String::new();
     let mut doc_number = 0;
@@ -415,6 +421,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
     // Tickets all currently have their DateTimes set to 12 noon EST, since
     // extracting their datetimes is hard and cannot be done yet. More info in
     // issue 3 on GitHub.
+    // FIXME: Improper handing of errors here can crash the program
     let mut datetime = Utc.timestamp_nanos(0);
     if pdf_type == PDFType::BatchWeight {
         let combined = format!("{} {}", &date, &time);
@@ -442,16 +449,30 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
     let duplicate = if num_entries == 0 {String::new()} else {format!("_{}",num_entries.to_string())}; // There should only ever be one entry for this, but should a duplicate arise this handles it.
     let type_initials = if pdf_type == PDFType::DeliveryTicket {"DT"} else if pdf_type == PDFType::BatchWeight {"BW"} else {"ZZ"};
     let relative_filepath = format!("{}_{}_{}{}{}.pdf",datetime.format("%Y/%b/%d").to_string(), customer, type_initials, doc_number, duplicate); // eg. 2022/Aug/7_John Doe_DT154.pdf
-    
-    
+    let crc32 = Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+    let checksum = crc32.checksum(&pdf_as_bytes);
+
     let pdf_metadata = PDFMetadata { 
         datetime:       datetime, // NOTE: As of Dec 21 2022, this date uses a different format in Batch Weights vs Delivery Tickets
         pdf_type:       pdf_type,
         customer :      customer,
         relative_path:  relative_filepath,
         doc_number:     doc_number,
+        crc32_checksum: checksum,
     };
     
+    // Check whether pdf with this metadata already exists in database
+    let row = db.query_one("SELECT COUNT(*) FROM pdfs WHERE crc32_checksum = $1 AND pdf_num = $2 AND pdf_type = $3;",
+            &[&(pdf_metadata.crc32_checksum as i32), &pdf_metadata.doc_number, &(pdf_metadata.pdf_type as i32)]);
+    if let Err(error) = row {return INTERNAL_SERVER_ERROR.clone_with_message(format!("Was not able to check if file already existed in server. Error: {}", error.to_string())) ;}
+    let row = row.unwrap();
+    if row.len() < 1 {return INTERNAL_SERVER_ERROR.clone_with_message("Tried to check if file already existed in database before adding it. Result from SQL query had no response when one was expected.".to_string()); }
+    let count: i64 = row.get(0);
+    debug_println!("Count: {}", count);
+    if count > 0 {
+        return OK.clone_with_message("File already exists in server. Taking no action.".to_string());
+    } 
+
     // Place the PDF file into the correct place into the filesystem
     {
         let path_string = format!("{}{}{}", ROOT_DIR, "/belgrade/documents/", &pdf_metadata.relative_path);
@@ -466,14 +487,15 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
     debug_println!("METADATA: {:#?}", pdf_metadata);
 
     // Store PDF into Database
-    db.query(concat!("INSERT INTO pdfs (pdf_type, pdf_num, pdf_datetime, customer, relative_path)",
-            "VALUES ($1, $2, $3, $4, $5);"),
+    db.query(concat!("INSERT INTO pdfs (pdf_type, pdf_num, pdf_datetime, customer, relative_path, crc32_checksum)",
+            "VALUES ($1, $2, $3, $4, $5, $6);"),
             &[&(pdf_metadata.pdf_type as i32),
             &pdf_metadata.doc_number,
             &datetime, 
             &pdf_metadata.customer,
-            &pdf_metadata.relative_path]
-    ).unwrap();
+            &pdf_metadata.relative_path,
+            &(pdf_metadata.crc32_checksum as i32)]
+    );
 
 
     // This is where the PDF should be parsed
