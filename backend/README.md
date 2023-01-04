@@ -1,16 +1,30 @@
-# The RMC Site
+# RMC Backend
 
-This site is mainly handled by an nginx webserver, which is used to direct content to the right place. In the future, this webserver may be replaced by a custom solution.
+For a general overview of how the site works, take a look at the [Readme for the entire site](../README.md). This is a more technical overview of the backend.
 
-Postgres is sometimes difficult to installa, but may be installed on Debian by default
+Note: This repo has been stripped of any sensitive user data.
 
-When belgrade is accessed, nginx will redirect the request to a rust webserver
+## Overview
+All web requests go through the NGINX webserver. Static content (at set locations) is served by NGINX. Requests for dynamic content (ie. requests with specific queries or to the API) are passed to the rust webserver, a proxy server.
 
-This site uses a custom webserver in the backend (using Rust) to serve up webpages and APIs. APIs follow the REST method of organizing content.
+### The Rust Webserver
+This is a simple webserver. It processes a request by:
+1. Reading text from a TcpStream into a buffer
+2. Parsing what is within that buffer
+3. Generating a response and writing it to the TcpStream before closing it.
 
-###### (This site has been stripped of any user data)
+All text sent in the request will be stored as metadata while sending a response, as is, except for one exception. Percent encoding in the URL will be decoded.
+
+### Responding to requests
+
+
+### Testing and Testcases
+Test cases are located in a batch script in `tests/curl-tests`.
+
+If the program is compiled with `--features echo-test`, then any request made to `/api/echo` or `/api/echo/*`. The server will respond with all the information it could gather from the http request.
 
 #### API Documentation
+This is under construction
 In order to interface with the API, a user must submit a valid token as a header in each HTTP request.
 Command | Location | Result | Safe?
 ---|---|---|---
