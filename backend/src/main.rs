@@ -19,10 +19,10 @@ const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
 const ROOT_DIR: &str ="/home/nate/code/rmc/site";
+const SITE: &str ="https://redimixdominica.com";
 const POSTGRES_ADDRESS: &str = "postgresql://nate:testpasswd@localhost/rmc";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
-// const ROOT_DIR: &str = "https://redimixdominica.com/belgrade/documents/";
 
 // [1] The current request buffer size is 4KB, the pagesize on the computer I'm
 // running the server on (and most Linux servers as of 2022 Dec). In theory,
@@ -130,16 +130,16 @@ fn main() {
         let response: Response;
         debug_println!("Processing complete. Dispatching request");
         let response: Response = match (request.method.as_str(), request.location.as_str()) {
-            ("GET", "/belgrade/documents/search")   => handle_query(&request, &mut db),
-            ("GET", "/styles.css")                  => handle_styles(),
-            ("GET", "/belgrade/documents/"_)        => get_document_search(&request),
-            ("GET", "/api/belgrade/documents/exists") => document_exists(&request.query, &mut db),
-            ("POST", "/api/belgrade/documents")     => handle_post(&request, &mut db),
-            _                                       => NOT_IMPLEMENTED,
+            ("GET", "/belgrade/documents/search")       => handle_query(&request, &mut db),
+            ("GET", "/styles.css")                      => handle_styles(),
+            ("GET", "/belgrade/documents/")             => get_document_search(&request),
+            ("GET", "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
+            ("POST", "/api/belgrade/documents")         => handle_post(&request, &mut db),
+            _                                           => NOT_IMPLEMENTED,
         };
         match request.location.as_str() {
-            ("/styles.css")                 => response.send(&mut stream, "text/css"),
-            ("/belgrade/documents/search")  => response.send(&mut stream, "text/html"),
+            "/styles.css"                   => response.send(&mut stream, "text/css"),
+            "/belgrade/documents/search"    => response.send(&mut stream, "text/html"),
             _                               => response.send(&mut stream, "text/plain"),
         }
     }
@@ -165,10 +165,25 @@ fn handle_styles () -> Response {
 fn document_exists(queries: &HashMap<String, String>, db: &mut Client) -> Response {
     // Verify the appropriate queries exist
     if !queries.contains_key("crc32") { return BAD_REQUEST.clone_with_message("This request requires a crc32 query".to_string()); }
+    let crc32_checksum = queries.get("crc32").unwrap();
+    let crc32_checksum = crc32_checksum.parse::<u32>();
+    if let Err(error) = crc32_checksum { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not parse checksum into u32 from database. Error: {}", error.to_string())); }
+    let crc32_checksum: u32 = crc32_checksum.unwrap();
+    debug_println!("checksum: {} ... i32: {}", crc32_checksum, crc32_checksum as i32);
+
     if !queries.contains_key("type") { return BAD_REQUEST.clone_with_message("This request requires a type query".to_string()); }
+    let pdf_type = queries.get("type").unwrap().parse::<i32>();
+    if let Err(error) = pdf_type { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not parse pdf_type into i32 from database. Error: {}", error.to_string())); }
+    let pdf_type: i32 = pdf_type.unwrap();
+    
     if !queries.contains_key("num") { return BAD_REQUEST.clone_with_message("This request requires a num query".to_string()); }
-    let row = db.query_one(&format!("SELECT COUNT(*) FROM pdfs WHERE pdf_type = {} AND pdf_num = {} AND crc32_checksum = {};",
-            queries.get("type").unwrap(), queries.get("num").unwrap(), queries.get("crc32").unwrap()),&[]);
+    let pdf_num = queries.get("num").unwrap().parse::<i32>();
+    if let Err(error) = pdf_num { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not parse pdf_num into i32 from database. Error: {}", error.to_string())); }
+    let pdf_num: i32 = pdf_num.unwrap();
+
+    debug_println!("Checksum: {}, Type: {}, Num: {}", crc32_checksum, pdf_type, pdf_num);
+    let row = db.query_one("SELECT COUNT(*) FROM pdfs WHERE pdf_type = $1 AND pdf_num = $2 AND crc32_checksum = $3;",
+            &[&pdf_type, &pdf_num, &(crc32_checksum as i32)]);
     if let Err(error) = row { return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not execute the document exists query on the database. Error: {}", error.to_string())); }
     let row = row.unwrap();
     let document_count: i64 = row.get(0);
@@ -273,7 +288,7 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
         // debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {} Path: {}", datetime, pdf_type, pdf_num, customer, relative_path);
 
         let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}/belgrade/documents/{}\">Link</a></td></tr>",
-                datetime.format("%Y-%b-%d %I:%M %p").to_string(), pdf_type, pdf_num, customer, ROOT_DIR, relative_path);
+                datetime.format("%Y-%b-%d %I:%M %p").to_string(), pdf_type, pdf_num, customer, SITE, relative_path);
         table.push_str(&table_row);
     }
     table.push_str("</table>");
@@ -426,11 +441,21 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
     if pdf_type == PDFType::BatchWeight {
         let combined = format!("{} {}", &date, &time);
         debug_println!("date: {}, time: {}, combined: {}", &date, &time, &combined);
-        datetime = GMTPlus4.datetime_from_str(&combined, "%e-%b-%Y %I:%M:%S %p").unwrap().with_timezone(&Utc);
+        let dt = GMTPlus4.datetime_from_str(&combined, "%e-%b-%Y %I:%M:%S %p");
+        if let Ok(dt) = dt {
+            datetime = dt.with_timezone(&Utc);
+        } else {
+            datetime = Utc.with_ymd_and_hms(1970, 1, 1, 12, 0, 0).unwrap();
+        }
     } else if pdf_type == PDFType::DeliveryTicket {
         let combined = format!("{} 12:00:00", &date);
         debug_println!("date: {}", &combined);
-        datetime = GMTPlus4.datetime_from_str(&combined, "%d/%m/%Y %H:%M:%S").unwrap().with_timezone(&Utc); 
+        let dt = GMTPlus4.datetime_from_str(&combined, "%d/%m/%Y %H:%M:%S");
+        if let Ok(dt) = dt {
+            datetime = dt.with_timezone(&Utc);
+        } else {
+            datetime = Utc.with_ymd_and_hms(1970, 1, 1, 12, 0, 0).unwrap();
+        } 
     } else {
         datetime = Utc.with_ymd_and_hms(1970, 1, 1, 12, 0, 0).unwrap();
     }
