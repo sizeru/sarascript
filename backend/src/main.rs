@@ -199,7 +199,7 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     let query = urlencoding::decode(query);
     if let Err(error) = query { return BAD_REQUEST.clone_with_message(format!("Could not decode query into UTF-8: {}", error.to_string())); }
     let query = query.unwrap().into_owned();
-    if query.contains("\"") { return BAD_REQUEST.clone_with_message("queries cannot have the \" character in them.".to_string()); }
+    if query.contains("\"") || query.contains("'") { return BAD_REQUEST.clone_with_message("queries cannot have the \" or ' character in them.".to_string()); }
 
     let filter = request.query.get("filter");
     if filter.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'filter' field".to_string());}
@@ -207,7 +207,7 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     let filter = urlencoding::decode(filter);
     if let Err(error) = filter { return BAD_REQUEST.clone_with_message(format!("Could not decode filter into UTF-8: {}", error.to_string())); }
     let filter = filter.unwrap().into_owned();
-    if filter.contains("\"") { return BAD_REQUEST.clone_with_message("filters cannot have the \" character in them.".to_string()); }
+    if query.contains("\"") || query.contains("'") { return BAD_REQUEST.clone_with_message("filters cannot have the \" or ' characters in them.".to_string()); }
 
     let from = request.query.get("from");
     if from.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'from' field".to_string());}
