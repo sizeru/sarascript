@@ -19,7 +19,7 @@ const LOCAL: &str = "127.0.0.1:7878";
 const IPV4: &str = "45.77.158.123:7878";
 const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
 const ROOT_DIR: &str ="/home/nate/code/rmc/site";
-const SITE: &str ="https://redimixdominica.com";
+const SITE: &str ="dud";
 const POSTGRES_ADDRESS: &str = "postgresql://nate:testpasswd@localhost/rmc";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
@@ -249,19 +249,18 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     debug_println!("Query: {} Filter: {} Processed datetimes --- From: {:?} To: {:?}", query, filter, from_datetime, to_datetime);
     
     // Everything has been extracted and processed. Ready for database query
-    const BASE_REQUEST: &str = "SELECT pdf_datetime, pdf_type, pdf_num, customer, relative_path FROM pdfs WHERE pdf_datetime BETWEEN $1 AND $2";
+    const BASE_REQUEST: &str = r#"WITH r AS (SELECT CASE WHEN (e.customer = '') IS NOT FALSE THEN c.pdf_datetime ELSE e.pdf_datetime END, pdf_num, CASE WHEN (e.customer <> '') IS NOT FALSE THEN c.customer ELSE e.customer END, relative_path, "dt_path" FROM ( SELECT pdf_datetime, pdf_num, customer, relative_path FROM pdfs WHERE pdf_type = 1 ) AS e FULL JOIN ( SELECT pdf_num, pdf_datetime, customer, relative_path AS "dt_path" FROM pdfs WHERE pdf_type = 2 ) AS c USING (pdf_num)) SELECT * FROM r WHERE pdf_datetime BETWEEN $1 AND $2"#;
+    // const BASE_REQUEST: &str = "SELECT pdf_datetime, pdf_type, pdf_num, customer, relative_path FROM pdfs WHERE pdf_datetime BETWEEN $1 AND $2";
     let full_query = match filter.as_str() {
         "Customer" => {
-            format!("{} AND customer ILIKE '%{}%';", BASE_REQUEST, query)
+            format!("{} AND customer ILIKE '%{}%' ORDER BY pdf_num;", BASE_REQUEST, query)
         }
-        "Delivery Ticket #" => {
-            format!("{} AND pdf_type = 2 AND pdf_num = {};", BASE_REQUEST, query)
-        },
-        "Batch Weight #" => {
-            format!("{} AND pdf_type = 1 AND pdf_num = {};", BASE_REQUEST, query)
+        "Number" => {
+            let num = if let Ok(number) = query.parse::<u32>() { number } else { return BAD_REQUEST.clone_with_message("A valid number was not included in the search".to_string())};
+            format!("{} AND pdf_num = {};", BASE_REQUEST, num )
         },
         _ => { 
-            format!("{} AND relative_path ILIKE '%{}%';", BASE_REQUEST, query)
+            format!("{} AND relative_path ILIKE '%{}%' ORDER BY pdf_num;", BASE_REQUEST, query)
         }
     };
     
@@ -273,22 +272,17 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     
     // Create HTML table in response
     let entries = rows.len();
-    let mut table = format!("<p>Found {} entries</p><table><tr><th>DateTime</th><th>Type</th><th>Num</th><th>Customer</th><th>Link</th></tr>", entries);
+    let mut table = format!("<p>Found {} entries</p><table><tr><th>DateTime</th><th>Num</th><th>Customer</th><th>Batch Weights</th><th>Delivery Ticket</th></tr>", entries);
     for row in rows {
         let datetime: DateTime<Utc> = row.get(0);
-        let pdf_type: i32 = row.get(1);
-        let pdf_type = match pdf_type {
-            1 => {"BW"},
-            2 => {"DT"},
-            _ => {"N/A"},
-        };
-        let pdf_num: i32 = row.get(2);
-        let customer: &str = row.get(3);
-        let relative_path: &str = row.get(4);
+        let pdf_num: i32 = row.get(1);
+        let customer: &str = row.get(2);
+        let bw_path: String = if let Ok(path) = row.try_get::<_, &str>(3) { format!("<a href=\"{}/belgrade/documents/{}\">Weights</a>", SITE, path) } else { String::new() };
+        let dt_path: String = if let Ok(path) = row.try_get::<_, &str>(4) { format!("<a href=\"{}/belgrade/documents/{}\">Ticket</a>", SITE, path) } else { String::new() };
         // debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {} Path: {}", datetime, pdf_type, pdf_num, customer, relative_path);
 
-        let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"{}/belgrade/documents/{}\">Link</a></td></tr>",
-                datetime.format("%Y-%b-%d %I:%M %p").to_string(), pdf_type, pdf_num, customer, SITE, relative_path);
+        let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                datetime.with_timezone(&GMTPlus4).format("%Y-%b-%d %I:%M %p").to_string(), pdf_num, customer, bw_path, dt_path);
         table.push_str(&table_row);
     }
     table.push_str("</table>");
