@@ -23,6 +23,21 @@ Test cases are located in a batch script in `tests/curl-tests`.
 
 If the program is compiled with `--features echo-test`, then any request made to `/api/echo` or `/api/echo/*`. The server will respond with all the information it could gather from the http request.
 
+### The Config Files
+
+**What is the config?** The config is a text file which contains information that the program uses to configure and personalize its setup on each run. The point of having a config is so that a user can change basic settings about the program without having to rebuild the program. Currently there are two config files: One for the HTTP handling module and the other for the RMC application itself.
+
+**What is in the config?** A config should include all customizable data which is used by the progam. In this case:
+
+__The HTTP config includes__
+- ***The domain name of the website***. This is used when generating links which will be displayed on a webpage.
+
+__The RMC webserver config includes__
+- ***The website address to use.*** This can either be an IPV4 or IPV6 address (domain name should work but it has not been tested).
+- ***The root directory of the website's content***
+- ***The postgres connection address***. This includes the postgres username, database name, and password
+
+
 #### API Documentation
 This is under construction
 In order to interface with the API, a user must submit a valid token as a header in each HTTP request.
