@@ -29,11 +29,10 @@ If the program is compiled with `--features echo-test`, then any request made to
 
 **What is in the config?** A config should include all customizable data which is used by the progam. In this case:
 
-__The HTTP config includes__
-- ***The domain name of the website***. This is used when generating links which will be displayed on a webpage.
 
 __The RMC webserver config includes__
 - ***The website address to use.*** This can either be an IPV4 or IPV6 address (domain name should work but it has not been tested).
+- ***The domain name of the website***. This is used when generating links which will be displayed on a webpage.
 - ***The root directory of the website's content***
 - ***The postgres connection address***. This includes the postgres username, database name, and password
 
