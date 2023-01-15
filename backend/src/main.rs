@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs::{File, self};
-use std::io::{prelude::*};
-use std::net::TcpListener;
+use std::io::{prelude::*, BufReader};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::GMTPlus4;
@@ -10,17 +11,12 @@ use crc::Crc;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls};
 mod http;
+mod config_parser;
 use crate::http::*;
 
 
 // RUST WEBSERVER CONSTANTS
-const REQUEST_BUFFER_SIZE: usize = 4096;
-const LOCAL: &str = "127.0.0.1:7878";
-const IPV4: &str = "45.77.158.123:7878";
-const IPV6: &str = "[2001:19f0:5:5996&:5400:4ff:fe02:3d3e]:7878";
-const ROOT_DIR: &str ="/home/nate/code/rmc/site";
-const SITE: &str ="dud";
-const POSTGRES_ADDRESS: &str = "postgresql://nate:testpasswd@localhost/rmc";
+const CONFIG_PATH: &str = "/home/nate/code/rmc/backend/data/config.ini";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
 
@@ -35,6 +31,33 @@ const LF: &[u8] = &[10 as u8];
 // very low priority. All data must be sent as a binary stream in the body of a
 // request.
 
+#[derive(Debug)]
+struct Config {
+    content_root_dir: String,
+    ip: String,
+    domain_name: String,
+    postgres_address: String,
+}
+
+impl Config {
+    // This is critical path, but only runs once at the very start of the code
+    // so this code SHOULD panic is something goes wrong
+    pub fn parse_from(filepath: &str) -> Config {
+        let values = config_parser::parse(filepath).unwrap();
+        
+        let domain_name = values.get("domain_name").unwrap();
+        let content_root_dir = values.get("content_root_dir").unwrap();
+        let postgres_address = values.get("postgres_address").unwrap();
+        let ip = values.get("ip").unwrap();
+
+        return Config {
+            content_root_dir: content_root_dir.to_string(), 
+            ip: ip.to_string(),
+            domain_name: domain_name.to_string(),
+            postgres_address: postgres_address.to_string()
+        };
+    }
+}
 
 // println which only appears in debug mode
 #[cfg(debug_assertions)]
@@ -104,11 +127,12 @@ fn u8_index_of_multi(array: &[u8], predicate: &[u8], start_index: usize, end_ind
 
 // The main loop for the webserver
 fn main() {
-    debug_println!("--Begin--  Root dir is set at: {}", ROOT_DIR);
+    let config = Config::parse_from(CONFIG_PATH);
+    debug_println!("Values read from config: {:#?}", config);
     
     // Create singletons which will be used throughout the program
-    let listener = TcpListener::bind(LOCAL).expect("Aborting: Could not connect to server");
-    let mut db = Client::connect(POSTGRES_ADDRESS, NoTls).unwrap();       
+    let listener = TcpListener::bind(config.ip).expect("Aborting: Could not connect to server");
+    let mut db = Client::connect(&config.postgres_address, NoTls).unwrap();       
     let mut request_buffer = RequestBuffer::new(); 
     // request_buffer be used for every request. pre-allocating on stack.
 
@@ -127,19 +151,19 @@ fn main() {
         }
         
         let request = request.unwrap();
-        let response: Response;
         debug_println!("Processing complete. Dispatching request");
         let response: Response = match (request.method.as_str(), request.location.as_str()) {
-            ("GET", "/belgrade/documents/search")       => handle_query(&request, &mut db),
-            ("GET", "/styles.css")                      => handle_styles(),
-            ("GET", "/belgrade/documents/")             => get_document_search(&request),
+            ("GET", "/belgrade/documents/search")       => SERVICE_UNAVAILABLE.clone_with_message("Searching disabled until passwords are implemented.".to_string()), // if user_has_authentication(&request) {todo!()} else {get_authentication()}, //handle_query(&request, &mut db),
+            ("GET", "/styles.css")                      => handle_styles(&config.content_root_dir),
+            ("GET", "/belgrade/documents/")             => get_document_search(&request, &config.content_root_dir),
             ("GET", "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
-            ("POST", "/api/belgrade/documents")         => handle_post(&request, &mut db),
+            ("POST", "/api/belgrade/documents")         => handle_post(&request, &mut db, &config.content_root_dir),
             _                                           => NOT_IMPLEMENTED,
         };
         match request.location.as_str() {
             "/styles.css"                   => response.send(&mut stream, "text/css"),
             "/belgrade/documents/search"    => response.send(&mut stream, "text/html"),
+            "/belgrade/documents/"           => response.send(&mut stream, "text/html"),
             _                               => response.send(&mut stream, "text/plain"),
         }
     }
@@ -151,9 +175,9 @@ fn main() {
 }
 
 // Returns the stylesheet
-fn handle_styles () -> Response {
+fn handle_styles(content_root_dir: &str) -> Response {
     let mut stylesheet: Vec<u8> = vec![0; 4096];
-    let file = File::open(format!("{}/styles.css", ROOT_DIR));
+    let file = File::open(format!("{}/styles.css", content_root_dir));
     if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not open the styles.css file: {}", error.to_string())); }
     let mut file = file.unwrap();
     let bytes_read = file.read(&mut stylesheet);
@@ -191,7 +215,7 @@ fn document_exists(queries: &HashMap<String, String>, db: &mut Client) -> Respon
 }
 
 // Handles an http query to the database
-fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
+fn handle_query(request: &HttpRequest, db: &mut Client, content_root_dir: &str, domain_name: &str) -> Response {
     // Ensure all fields are present and decoded. Set defaults for empty strings
     let query = request.query.get("query");
     if query.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'query' field".to_string());}
@@ -277,8 +301,8 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
         let datetime: DateTime<Utc> = row.get(0);
         let pdf_num: i32 = row.get(1);
         let customer: &str = row.get(2);
-        let bw_path: String = if let Ok(path) = row.try_get::<_, &str>(3) { format!("<a href=\"{}/belgrade/documents/{}\">Weights</a>", SITE, path) } else { String::new() };
-        let dt_path: String = if let Ok(path) = row.try_get::<_, &str>(4) { format!("<a href=\"{}/belgrade/documents/{}\">Ticket</a>", SITE, path) } else { String::new() };
+        let bw_path: String = if let Ok(path) = row.try_get::<_, &str>(3) { format!("<a href=\"{}/belgrade/documents/{}\">Weights</a>", domain_name, path) } else { String::new() };
+        let dt_path: String = if let Ok(path) = row.try_get::<_, &str>(4) { format!("<a href=\"{}/belgrade/documents/{}\">Ticket</a>", domain_name, path) } else { String::new() };
         // debug_println!("Datetime: {:?}, PDF Type: {}, Num: {}, Customer: {} Path: {}", datetime, pdf_type, pdf_num, customer, relative_path);
 
         let table_row = format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
@@ -289,7 +313,7 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
 
     // Read from source html file and return appended file to client
     let mut index: Vec<u8> = vec![0;2048];
-    let mut file = File::open(format!("{}/belgrade/documents/index.html", ROOT_DIR));
+    let mut file = File::open(format!("{}/belgrade/documents/index.html", content_root_dir));
     if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message("Could not open the index.html file".to_owned()); }
     let mut file = file.unwrap();
     let bytes_read = file.read(&mut index);
@@ -309,10 +333,39 @@ fn handle_query(request: &HttpRequest, db: &mut Client) -> Response {
     return OK.clone_with_message(String::from_utf8(index).unwrap());
 }
 
+fn user_has_authentication(request: &HttpRequest) -> bool {
+    // If user does not have the appropriate Cookie
+    // ask user to enter a username and password
+    // if on list give user cookie
+    // return
+    if request.headers.contains_key("Cookie") {
+        let cookie = request.headers.get("Cookie").unwrap();
+        let cookie_file = File::open(format!("DATA_DIR{}", "/privelaged_cookies"));    
+        if cookie_file.is_err() {return false;}
+        let cookie_file = cookie_file.unwrap();
+        let reader = BufReader::new(cookie_file);
+        for line in reader.lines() {
+            if line.is_err() { continue; }
+            let line = line.unwrap();
+            if line.eq(cookie) {
+                return true;
+            }
+        }
+    }
+
+    // Cookie of client either does not match or was not found. Require authentication
+    return false;
+}
+
+fn get_authentication() -> Response {
+    return OK.clone_with_message(r#"<!DOCTYPE html><head><meta charset="UTF-8"><title>Documents</title><link rel="stylesheet" href="../../styles.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body><form><input type="text" name="user" placeholder="username"><input type="password" name="pass" placeholder="password"></form></body>"#.to_string())
+}
+
 // Handles a get to belgrade
-fn get_document_search(request: &HttpRequest) -> Response {
+fn get_document_search(request: &HttpRequest, content_root_dir: &str) -> Response {
     let mut index: Vec<u8> = vec![0;2048];
-    let mut file = File::open(format!("{}/belgrade/documents/index.html", ROOT_DIR));
+    let mut file = File::open(format!("{}/belgrade/documents/index.html", content_root_dir));
     if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message("Could not open the index.html file".to_owned()); }
     let mut file = file.unwrap();
     let bytes_read = file.read(&mut index);
@@ -324,7 +377,7 @@ fn get_document_search(request: &HttpRequest) -> Response {
 // Handles a POST Http request. This is typically where PDFs are received,
 // analyzed, and sorted into the correct location. Returns a success or error
 // message.
-fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
+fn handle_post(request: &HttpRequest, db: &mut Client, content_root_dir: &str) -> Response {
     // NOTE: Assumes that PDF is sent unmodified in Body. Currently, the minimum
     // required metadata for storing a PDF will be the date, customer, and
     // pdf-type (Delivery Ticket or Batch Weight).
@@ -494,7 +547,7 @@ fn handle_post(request: &HttpRequest, db: &mut Client) -> Response {
 
     // Place the PDF file into the correct place into the filesystem
     {
-        let path_string = format!("{}{}{}", ROOT_DIR, "/belgrade/documents/", &pdf_metadata.relative_path);
+        let path_string = format!("{}{}{}", content_root_dir, "/belgrade/documents/", &pdf_metadata.relative_path);
         let path = Path::new(&path_string);
         let prefix = path.parent().unwrap(); // path without final component
         debug_println!("Prefix: {:?}", prefix);

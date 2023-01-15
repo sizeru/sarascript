@@ -12,6 +12,7 @@ pub const INTERNAL_SERVER_ERROR: Response = Response{code:"500 Internal Server E
 pub const NOT_IMPLEMENTED: Response = Response{code:"501 Not Implemented", message:None};
 pub const CONTENT_TOO_LARGE: Response = Response{code:"413 Content Too Large", message:None};
 pub const LENGTH_REQUIRED: Response = Response{code:"411 Length Required", message:None};
+pub const SERVICE_UNAVAILABLE: Response = Response{code: "503 Service Unavailable", message:None};
 
 // RUST WEBSERVER CONSTANTS
 const REQUEST_BUFFER_SIZE: usize = 4096;

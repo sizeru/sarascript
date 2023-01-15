@@ -38,6 +38,7 @@ dependencies = [
  "crc",
  "num-digitize",
  "postgres",
+ "rand 0.8.5",
  "urlencoding",
 ]
 
