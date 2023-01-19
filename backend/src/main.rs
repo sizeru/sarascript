@@ -187,7 +187,7 @@ fn main() {
             ("GET", "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
             ("GET", "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
             ("GET", "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
-            ("POST","/api/belgrade/documents")          => handle_post(&request, &mut db, &config.content_root_dir),
+            ("POST","/api/belgrade/documents/")          => handle_post(&request, &mut db, &config.content_root_dir),
             _                                           => NOT_IMPLEMENTED,
         };
 
@@ -263,7 +263,7 @@ fn check_login(queries: &HashMap<String, String>, referer: &Option<&String>, dom
     // PASSWORD MATCHES !
     if reset {
         let mut response = FOUND;
-        response.add_header("Location", format!("{}/change-password.html", domain_name));
+        response.add_header("Location", "/change-password".to_string());
         return response;
         todo!("Need to add refer_to")
     }
@@ -279,22 +279,22 @@ fn check_login(queries: &HashMap<String, String>, referer: &Option<&String>, dom
             if let Some (location) = queries.get("return_to") {
                 let location = urlencoding::decode(&location);
                 if let Err(error) = location {
-                    response.add_header("Location", domain_name.to_string());
+                    response.add_header("Location", "/".to_string());
                     return response;
                 }
                 let encoded_location = location.unwrap().into_owned();
                 let location = urlencoding::decode(&encoded_location);
                 if let Err(encoded_location) = location {
-                    response.add_header("Location", domain_name.to_string());
+                    response.add_header("Location", "/".to_string());
                     return response;
                 }
                 debug_println!("location: {:?}", location);
-                response.add_header("Location", format!("{}{}", domain_name, location.unwrap()));
+                response.add_header("Location", location.unwrap().to_string());
                 return response;
             }
         }
     }
-    response.add_header("Location", domain_name.to_string());
+    response.add_header("Location", "/".to_string());
     return response;
 }
 
@@ -390,7 +390,7 @@ fn handle_query(request: &HttpRequest, db: &mut Client, queries: &HashMap<String
     let filter = urlencoding::decode(filter);
     if let Err(error) = filter { return BAD_REQUEST.clone_with_message(format!("Could not decode filter into UTF-8: {}", error.to_string())); }
     let filter = filter.unwrap().into_owned();
-    if query.contains("\"") || query.contains("'") { return BAD_REQUEST.clone_with_message("filters cannot have the \" or ' characters in them.".to_string()); }
+    if filter.contains("\"") || filter.contains("'") { return BAD_REQUEST.clone_with_message("filters cannot have the \" or ' characters in them.".to_string()); }
 
     let from = request.query.get("from");
     if from.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'from' field".to_string());}
@@ -519,7 +519,7 @@ fn authenticate(location: &str, queries: &HashMap<String, String>, domain_name: 
     } else {
         urlencoding::encode(&return_to)
     };
-    response.add_header("Location", format!("{}/login?return_to={}", domain_name, return_to));
+    response.add_header("Location", format!("/login?return_to={}", return_to));
     response.add_header("content-type", HTML.to_string());
     return response;
 }
