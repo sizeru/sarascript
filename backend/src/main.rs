@@ -1,15 +1,16 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs::{File, self};
 use std::io::{prelude::*, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::GMTPlus4;
 use compress::zlib;
 use crc::Crc;
 use num_digitize::FromDigits;
-use postgres::{Client, NoTls};
+use postgres::{Client, NoTls, GenericClient};
+use pwhash::sha512_crypt;
 mod http;
 mod config_parser;
 use crate::http::*;
@@ -71,7 +72,21 @@ macro_rules! debug_println {
     ($($input:expr),*) => {()}
 }
 
-
+// Macro which returns an error value to a function if it exists
+macro_rules! unwrap_either { // TODO: This could use a better name
+    // match something(q,r,t,6,7,8) etc
+    // compiler extracts function name and arguments. It injects the values in respective varibles.
+        ($a:ident)=>{
+           {
+            match $a {
+                Ok(value)=>value,
+                Err(err)=>{
+                    return err;
+                }
+            }
+            }
+        };
+    }
 
 // The various types of PDF which are processed
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -146,26 +161,37 @@ fn main() {
 
         let request = HttpRequest::parse(&mut stream, &mut request_buffer);
         if let Err(response) = request {
-            response.send(&mut stream, "text/plain");
+            response.send(&mut stream);
             continue;
         }
         
         let request = request.unwrap();
         debug_println!("Processing complete. Dispatching request");
+        // special checks for any documents
+        if request.method.eq("GET") && request.location.starts_with("/belgrade/documents/") && request.location.ne("/belgrade/documents/search") {
+            let response;
+            if let Err(redirect_response) = check_authentication(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &mut db) {
+                response = redirect_response;
+            } else {
+                response = get_pdf(&request.location, &config.content_root_dir); 
+            }
+            response.send(&mut stream);
+            continue;
+        }
+
         let response: Response = match (request.method.as_str(), request.location.as_str()) {
-            ("GET", "/belgrade/documents/search")       => SERVICE_UNAVAILABLE.clone_with_message("Searching disabled until passwords are implemented.".to_string()), // if user_has_authentication(&request) {todo!()} else {get_authentication()}, //handle_query(&request, &mut db),
-            ("GET", "/styles.css")                      => handle_styles(&config.content_root_dir),
-            ("GET", "/belgrade/documents/")             => get_document_search(&request, &config.content_root_dir),
+            ("GET", "/belgrade/documents/search")       => handle_query(&request, &mut db, &request.query, &config.content_root_dir, &config.domain_name),
+            ("GET", "/belgrade/documents")              => get_document_search(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &config.content_root_dir, &mut db),
+            ("GET", "/css/styles.css")                  => get_styles(&request.location, &config.content_root_dir),
+            ("GET", "/login")                           => get_login(&config.content_root_dir),
+            ("GET", "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
+            ("GET", "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
             ("GET", "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
-            ("POST", "/api/belgrade/documents")         => handle_post(&request, &mut db, &config.content_root_dir),
+            ("POST","/api/belgrade/documents")          => handle_post(&request, &mut db, &config.content_root_dir),
             _                                           => NOT_IMPLEMENTED,
         };
-        match request.location.as_str() {
-            "/styles.css"                   => response.send(&mut stream, "text/css"),
-            "/belgrade/documents/search"    => response.send(&mut stream, "text/html"),
-            "/belgrade/documents/"           => response.send(&mut stream, "text/html"),
-            _                               => response.send(&mut stream, "text/plain"),
-        }
+
+        response.send(&mut stream);
     }
     
     // Should never reach this...
@@ -174,15 +200,145 @@ fn main() {
     }
 }
 
-// Returns the stylesheet
-fn handle_styles(content_root_dir: &str) -> Response {
-    let mut stylesheet: Vec<u8> = vec![0; 4096];
-    let file = File::open(format!("{}/styles.css", content_root_dir));
-    if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not open the styles.css file: {}", error.to_string())); }
+// Reads all bytes from a file. Returns a response if it was unable to.
+fn read_all_bytes(filepath: &str) -> Result<Vec<u8>, Response> {
+    let file = File::open(filepath);
+    if let Err(error) = file {
+        return Err(INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not open the requested file: {}", error.to_string())));
+    }
     let mut file = file.unwrap();
-    let bytes_read = file.read(&mut stylesheet);
-    if let Err(error) = bytes_read {return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not read from the index.html file: {}", error.to_string())); }
-    return OK.clone_with_message(String::from_utf8(stylesheet).unwrap());
+    let mut bytes = Vec::new();
+    let bytes_read = file.read_to_end(&mut bytes);
+    if let Err(error) = bytes_read {
+        return Err(INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not read from the requested file: {}", error.to_string()))); 
+    }
+    return Ok(bytes);
+}
+
+// Return the login page. Save the referer in the URL 
+fn get_login(content_root_dir: &str) -> Response {
+    let login = read_all_bytes(&format!("{}{}", content_root_dir, "/login.html"));
+    let login = unwrap_either!(login);  
+    
+    let mut response = OK;
+    response.add_header("content-type", HTML.to_string());
+    response.add_message(login);
+    return response;
+}
+
+// A user has just submitted a form with his credentials. Perform the
+// cryptographic hashing and match it to data stored in the server. If the user
+// is who they say they are, give them a cookie and return them to the page they
+// tried to access. Otherwise, return them to the login page again
+fn check_login(queries: &HashMap<String, String>, referer: &Option<&String>, domain_name: &str, db: &mut Client) -> Response {
+    let user = queries.get("user");
+    if user.is_none() { return BAD_REQUEST.clone_with_message("Query must have user field".to_string()); }
+    let user = user.unwrap();
+    let password = queries.get("pass");
+    if password.is_none() { return BAD_REQUEST.clone_with_message("Query must have password field".to_string()); }
+    let password = password.unwrap();
+    
+    // Get details from the database about the hash
+    let row = db.query_opt("SELECT * FROM users WHERE username = $1", &[user]);
+    if row.is_err() {
+        return INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not get username from db. Error: {}", row.unwrap_err().to_string()));
+    }
+    let row = row.unwrap();
+    
+    if row.is_none() {
+        // no username with that 
+        return OK.clone_with_message("User not found".to_string());
+    }
+    let row = row.unwrap();
+    let hash: String = row.get(1); // 106 characters long
+    let reset: bool = row.get(2);
+
+    // A password hash is the username combined with the password, with an added salt
+    let combined_password = format!("{}{}", user, password);
+    if !sha512_crypt::verify(password, &hash) {
+        return OK.clone_with_message("Password incorrect".to_string());
+    }
+
+    debug_println!("password matches");
+    // PASSWORD MATCHES !
+    if reset {
+        let mut response = FOUND;
+        response.add_header("Location", format!("{}/change-password.html", domain_name));
+        return response;
+        todo!("Need to add refer_to")
+    }
+    debug_println!("No reset");
+    
+    // Password is okay
+    let mut response = FOUND;
+    add_cookie(&mut response, db, true, &user);
+    debug_println!("Cookie added");
+    // Check for return address in Referer link to decide which location to redirect to
+    if let Some(referer) = referer {
+        if let Ok((_, queries)) = http::parse_location(referer) {
+            if let Some (location) = queries.get("return_to") {
+                let location = urlencoding::decode(&location);
+                if let Err(error) = location {
+                    response.add_header("Location", domain_name.to_string());
+                    return response;
+                }
+                let encoded_location = location.unwrap().into_owned();
+                let location = urlencoding::decode(&encoded_location);
+                if let Err(encoded_location) = location {
+                    response.add_header("Location", domain_name.to_string());
+                    return response;
+                }
+                debug_println!("location: {:?}", location);
+                response.add_header("Location", format!("{}{}", domain_name, location.unwrap()));
+                return response;
+            }
+        }
+    }
+    response.add_header("Location", domain_name.to_string());
+    return response;
+}
+
+// Create a 
+fn add_cookie(response: &mut Response, db: &mut Client, authenticated: bool, username: &str) -> Result<(), postgres::Error> {
+    const COOKIE_LEN: usize = 225; // This size is arbitrary
+    // This is not cryptographically secure
+    let mut cookie = [0 as u8; COOKIE_LEN];
+    for i in 0..COOKIE_LEN {
+        cookie[i] = rand::random();
+    }
+    let cookie = general_purpose::STANDARD.encode(cookie);
+    let rows_modified = db.execute("INSERT INTO cookies (cookie, username, authenticated, created) VALUES ($1, $2, $3, now());",
+            &[&cookie, &username, &authenticated]);
+    if let Err(error) = rows_modified {
+        debug_println!("ERROR: {}", error);
+        return Err(error);
+    }
+    response.add_header("Set-Cookie", format!("id={}; Path=/belgrade/", cookie));
+    Ok(())
+}
+
+// Returns the stylesheet
+fn get_styles(location: &str, content_root_dir: &str) -> Response {
+    let stylesheet = read_all_bytes(&format!("{}{}", content_root_dir, location));
+    let stylesheet = unwrap_either!(stylesheet);  
+    // if stylesheet.is_err() {
+    //     return stylesheet.unwrap_err();
+    // } 
+    // let stylesheet = stylesheet.unwrap();
+    
+    let mut response = OK;
+    response.add_header("content-type", CSS.to_string());
+    response.add_message(stylesheet);
+    return response;
+}
+
+fn get_pdf(location: &str, content_root_dir: &str) -> Response {
+    let mut response = OK;
+    response.add_header("content-type", PDF.to_string());
+    let pdf = read_all_bytes(&format!("{}{}", content_root_dir, location));
+    let pdf = unwrap_either!(pdf);
+    response.add_message(pdf);
+    return response;
 }
 
 // Returns whether a document exists in the database
@@ -215,7 +371,10 @@ fn document_exists(queries: &HashMap<String, String>, db: &mut Client) -> Respon
 }
 
 // Handles an http query to the database
-fn handle_query(request: &HttpRequest, db: &mut Client, content_root_dir: &str, domain_name: &str) -> Response {
+fn handle_query(request: &HttpRequest, db: &mut Client, queries: &HashMap<String, String>, content_root_dir: &str, domain_name: &str) -> Response {
+    if let Err(response) =  check_authentication(&request.location, queries, request.headers.get("Cookie"), domain_name, db) {
+        return response;
+    }
     // Ensure all fields are present and decoded. Set defaults for empty strings
     let query = request.query.get("query");
     if query.is_none() {return BAD_REQUEST.clone_with_message("Query must have 'query' field".to_string());}
@@ -330,48 +489,80 @@ fn handle_query(request: &HttpRequest, db: &mut Client, content_root_dir: &str, 
     index.append(&mut table);
     index.append(&mut b"</body>".to_vec());
 
-    return OK.clone_with_message(String::from_utf8(index).unwrap());
+    let mut response = OK;
+    response.add_message(index);
+    response.add_header("content-type", HTML.to_string());
+    return response;
 }
 
-fn user_has_authentication(request: &HttpRequest) -> bool {
-    // If user does not have the appropriate Cookie
-    // ask user to enter a username and password
-    // if on list give user cookie
-    // return
-    if request.headers.contains_key("Cookie") {
-        let cookie = request.headers.get("Cookie").unwrap();
-        let cookie_file = File::open(format!("DATA_DIR{}", "/privelaged_cookies"));    
-        if cookie_file.is_err() {return false;}
-        let cookie_file = cookie_file.unwrap();
-        let reader = BufReader::new(cookie_file);
-        for line in reader.lines() {
-            if line.is_err() { continue; }
-            let line = line.unwrap();
-            if line.eq(cookie) {
-                return true;
-            }
+fn is_authenticated(cookie: &str, db: &mut Client) -> bool {
+    let row_result = db.query_opt("SELECT * FROM cookies where cookie = $1", &[&cookie]);
+    if let Ok(optional_row) = row_result {
+        if let Some(row) = optional_row {
+            return true;
         }
     }
-
-    // Cookie of client either does not match or was not found. Require authentication
     return false;
 }
 
-fn get_authentication() -> Response {
-    return OK.clone_with_message(r#"<!DOCTYPE html><head><meta charset="UTF-8"><title>Documents</title><link rel="stylesheet" href="../../styles.css">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body><form><input type="text" name="user" placeholder="username"><input type="password" name="pass" placeholder="password"></form></body>"#.to_string())
+fn authenticate(location: &str, queries: &HashMap<String, String>, domain_name: &str) -> Response {
+    let mut response = FOUND;
+    let mut return_to = urlencoding::encode(location).to_string();
+    if queries.len() > 0 {
+        return_to.push('?');
+        for (key, value) in queries {
+            return_to.push_str(&format!("{}={}&", key, value));
+        }
+    }
+    let return_to = urlencoding::encode(&return_to[..return_to.len()-1]);
+    response.add_header("Location", format!("{}/login?return_to={}", domain_name, return_to));
+    response.add_header("content-type", HTML.to_string());
+    return response;
+}
+
+fn extract_cookie(cookie: &str) -> Option<&str> {
+    // This is just hard coded right now.
+    if cookie.len() > 3 {
+        return Some(&cookie[3..]);
+    } else {
+        return None;
+    }
+}
+
+fn check_authentication(location: &str, queries: &HashMap<String, String> ,cookie: Option<&String>, domain_name: &str, db: &mut Client) -> Result<(), Response> {
+    if let Some(cookie) = cookie {
+        if let Some(cookie) = extract_cookie(cookie) {
+            if !is_authenticated(cookie, db) {
+                return Err(authenticate(location, queries, domain_name));
+            } else { // This is the only safe path 
+                return Ok(())
+            }
+        } else {
+            return Err(authenticate(location, queries, domain_name));
+        }
+    } else {
+        return Err(authenticate(location, queries, domain_name));
+    }
 }
 
 // Handles a get to belgrade
-fn get_document_search(request: &HttpRequest, content_root_dir: &str) -> Response {
-    let mut index: Vec<u8> = vec![0;2048];
-    let mut file = File::open(format!("{}/belgrade/documents/index.html", content_root_dir));
-    if let Err(error) = file {return INTERNAL_SERVER_ERROR.clone_with_message("Could not open the index.html file".to_owned()); }
-    let mut file = file.unwrap();
-    let bytes_read = file.read(&mut index);
-    if let Err(error) = bytes_read {return INTERNAL_SERVER_ERROR.clone_with_message("Could not read from the index.html file".to_owned()); }
-    let bytes_read = bytes_read.unwrap();
-    return OK.clone_with_message(String::from_utf8(index).unwrap());
+fn get_document_search(location: &str, queries: &HashMap<String, String>, cookie: Option<&String>, domain_name: &str, content_root_dir: &str, db: &mut Client) -> Response {
+    if let Err(response) =  check_authentication(location, queries, cookie, domain_name, db) {
+        return response;
+    }
+
+    let path = format!("{}{}/index.html", content_root_dir, location);
+    debug_println!("{}", path);
+    let page = read_all_bytes(&path);  
+    if page.is_err() {
+        return page.unwrap_err();
+    } 
+    let page = page.unwrap();
+    
+    let mut response = OK;
+    response.add_header("content-type", HTML.to_string());
+    response.add_message(page);
+    return response;
 }
 
 // Handles a POST Http request. This is typically where PDFs are received,

@@ -10,3 +10,16 @@ CREATE TABLE IF NOT EXISTS pdfs (
     crc32_checksum  INT4
     -- other vars come here eventually
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    username            VARCHAR(30) PRIMARY KEY,
+    password_hash       CHAR(106),
+    reset_on_next_login BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS cookies (
+    cookie              CHAR(300) PRIMARY KEY,
+    username            VARCHAR(30),
+    authenticated       BOOLEAN,
+    created             TIMESTAMP
+);

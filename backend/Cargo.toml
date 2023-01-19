@@ -9,12 +9,14 @@ edition = "2021"
 echo-test = []
 
 [dependencies]
+base64 = "0.21.0"
 chrono = "0.4.23"
 chrono-tz = "0.8.1"
 compress = "0.2.1"
 crc = "3.0.0"
 num-digitize = "0.4.2"
 postgres = { versio="0.19.4", features=["with-chrono-0_4"] }
+pwhash = "1.0.0"
 rand = "0.8.5"
 urlencoding = "2.1.2"
 # base64 = "0.13.0"

@@ -1,19 +1,26 @@
-use std::io::{prelude::*};
+use std::io::prelude::*;
 use std::net::TcpStream;
 use std::collections::{HashMap};
 use crate::Body::{Single}; //NOTE: See [2]
 
 // HTTP Response Codes
-pub const BAD_REQUEST: Response = Response{code:"400 Bad Request", message:None} ;
-pub const OK: Response = Response{code:"200 OK", message:None};
-pub const CREATED: Response = Response{code:"201 Created", message:None};
-pub const ACCEPTED: Response = Response{code:"202 Accepted", message:None};
-pub const INTERNAL_SERVER_ERROR: Response = Response{code:"500 Internal Server Error", message:None};
-pub const NOT_IMPLEMENTED: Response = Response{code:"501 Not Implemented", message:None};
-pub const CONTENT_TOO_LARGE: Response = Response{code:"413 Content Too Large", message:None};
-pub const LENGTH_REQUIRED: Response = Response{code:"411 Length Required", message:None};
-pub const SERVICE_UNAVAILABLE: Response = Response{code: "503 Service Unavailable", message:None};
+pub const BAD_REQUEST: Response = Response{code:"400 Bad Request", headers:None, message:None} ;
+pub const OK: Response = Response{code:"200 OK", headers:None, message:None};
+pub const CREATED: Response = Response{code:"201 Created", headers:None, message:None};
+pub const ACCEPTED: Response = Response{code:"202 Accepted", headers:None, message:None};
+pub const INTERNAL_SERVER_ERROR: Response = Response{code:"500 Internal Server Error", headers:None, message:None};
+pub const NOT_IMPLEMENTED: Response = Response{code:"501 Not Implemented", headers:None, message:None};
+pub const CONTENT_TOO_LARGE: Response = Response{code:"413 Content Too Large", headers:None, message:None};
+pub const LENGTH_REQUIRED: Response = Response{code:"411 Length Required", headers:None, message:None};
+pub const SERVICE_UNAVAILABLE: Response = Response{code: "503 Service Unavailable", headers:None, message:None};
+pub const UNAUTHORIZED: Response = Response{code: "401 Unauthorized", headers:None, message:None};
+pub const FOUND: Response = Response{code: "302 Found", headers:None, message:None};
 
+// Frequently used content types
+pub const HTML: &str = "text/html";
+pub const TEXT: &str = "text/plain; charset=utf-8";
+pub const CSS: &str = "text/css";
+pub const PDF: &str = "application/pdf";
 // RUST WEBSERVER CONSTANTS
 const REQUEST_BUFFER_SIZE: usize = 4096;
 
@@ -33,7 +40,8 @@ macro_rules! debug_println {
 #[derive(Debug)]
 pub struct Response {
     code: &'static str,
-    message: Option<String>,
+    headers: Option<HashMap<&'static str, String>>,
+    message: Option<Vec<u8>>,
 }
 
 // This contains information about an HttpLine
@@ -75,19 +83,50 @@ impl RequestBuffer {
 impl Response {
 
     // Generates an HTTP Response Message
-    fn to_http(&self, content_type: &str) -> String {
-        if let Some(message) = &self.message {
-            return format!("HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n{}\r\n",
-                &self.code, &message.len() + 2, content_type, &message // add 2 to account for trailing \r\n
-            );
+    fn format(&self) -> Vec<u8> {
+        let mut response: Vec<u8> = Vec::new();
+        response.append(&mut format!("HTTP/1.1 {}\r\n", self.code).as_bytes().to_vec());
+        if let Some (headers) = &self.headers {
+            for (key, value) in headers {
+                response.append(&mut format!("{}: {}\r\n", key, value).as_bytes().to_vec());       
+            }
+            if !headers.contains_key("content-type") {
+                response.append(&mut "content-Type: text/plain; charset=utf-8\r\n".as_bytes().to_vec());
+            }
         } else {
-            return format!("HTTP/1.1 {}\r\n", &self.code);
+            response.append(&mut "content-type: text/plain; charset=utf-8\r\n".as_bytes().to_vec());
+        }
+        if let Some(message) = self.message.as_ref(){
+            let content_length = message.len() + 2;
+            response.append(&mut format!("Content-Length: {}\r\n\r\n",content_length).into_bytes().to_vec());
+            response.append(&mut message.clone());
+            response.append(&mut "\r\n".as_bytes().to_vec());
+        }
+        
+        return response;
+    }
+
+    // Adds a header to the response
+    pub fn add_header(&mut self, key: &'static str, value: String) {
+        if let Some(headers) = &mut self.headers {
+            headers.insert(key, value);
+        } else {
+            let mut headers = HashMap::with_capacity(1);
+            headers.insert(key, value);
+            self.headers = Some(headers);
         }
     }
 
+    // Adds a message to the response
+    pub fn add_message(&mut self, message: Vec<u8>) {
+        self.message = Some(message);
+    }
+
     // Sends an HTTP Response back to the client
-    pub fn send(&self, client_stream: &mut TcpStream, content_type: &str) {
-        if let Err(error) = client_stream.write(self.to_http(content_type).as_bytes()) {
+    pub fn send(&self, client_stream: &mut TcpStream) {
+        // This will make many repeated calls to write to the stream. It is easier to write the content this way
+
+        if let Err(error) = client_stream.write(&self.format().as_slice()) {
             println!("ERROR WHEN WRITING RESPONSE: {}", error.to_string());
         }
         if let Err(error) = client_stream.flush() {
@@ -96,8 +135,10 @@ impl Response {
         
     }
 
+    // Clone this response with a different message
     pub fn clone_with_message(&self, message: String) -> Response {
-        return Response{code: self.code, message: Some(message)};
+        let headers = self.headers.clone();
+        return Response{code: self.code, headers, message: Some(message.as_bytes().to_vec())};
     }
 }
 
@@ -120,8 +161,6 @@ pub enum Body {
     MultiPart(Vec<FormData>), // Struct with headers. Used when receiving multipart data.
     None
 }
-
-
 
 impl Body {
     pub fn single(&self) -> Result<&Vec<u8>, &str> {
@@ -320,8 +359,15 @@ fn parse_control_data_line (line_buffer: &LineBuffer) -> Result<HttpRequest, Res
     return Ok(HttpRequest::new(method, location, query, version));
 }
 
-fn parse_location(location_line: &String) -> Result<(String, HashMap<String, String>), Response> {
-    let values: Vec<&str> = location_line.split("?").collect();
+pub fn parse_location(location_line: &String) -> Result<(String, HashMap<String, String>), Response> {
+    let relative_location;
+    if let Some(index) = location_line.find("://") {
+        let index = index + 3;
+        relative_location =  &location_line[index..];
+    } else {
+        relative_location = location_line;
+    }
+    let values: Vec<&str> = relative_location.split("?").collect();
     let location = values[0].to_string();
     let location = urlencoding::decode(&location);
     if let Err(error) = location { return Err(BAD_REQUEST.clone_with_message(format!("The location in the url could not be decoded: {}", error.to_string()))); }
