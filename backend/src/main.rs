@@ -514,7 +514,11 @@ fn authenticate(location: &str, queries: &HashMap<String, String>, domain_name: 
             return_to.push_str(&format!("{}={}&", key, value));
         }
     }
-    let return_to = urlencoding::encode(&return_to[..return_to.len()-1]);
+    let return_to = if queries.len() > 0 {
+        urlencoding::encode(&return_to[..return_to.len()-1])
+    } else {
+        urlencoding::encode(&return_to)
+    };
     response.add_header("Location", format!("{}/login?return_to={}", domain_name, return_to));
     response.add_header("content-type", HTML.to_string());
     return response;
