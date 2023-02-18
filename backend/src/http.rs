@@ -100,8 +100,8 @@ impl Response {
             let content_length = message.len() + 2;
             response.append(&mut format!("Content-Length: {}\r\n\r\n",content_length).into_bytes().to_vec());
             response.append(&mut message.clone());
-            response.append(&mut "\r\n".as_bytes().to_vec());
         }
+        response.append(&mut "\r\n".as_bytes().to_vec());
         
         return response;
     }
@@ -125,7 +125,7 @@ impl Response {
     // Sends an HTTP Response back to the client
     pub fn send(&self, client_stream: &mut TcpStream) {
         // This will make many repeated calls to write to the stream. It is easier to write the content this way
-
+        debug_println!("Message: {:?}", String::from_utf8(self.format()));
         if let Err(error) = client_stream.write(&self.format().as_slice()) {
             println!("ERROR WHEN WRITING RESPONSE: {}", error.to_string());
         }

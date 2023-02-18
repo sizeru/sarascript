@@ -17,7 +17,7 @@ use crate::http::*;
 
 
 // RUST WEBSERVER CONSTANTS
-const CONFIG_PATH: &str = "/home/nate/code/rmc/backend/data/config.ini";
+const CONFIG_PATH: &str = "/var/www/redimix/backend/data/config.ini";
 const CR: &[u8] = &[13 as u8];
 const LF: &[u8] = &[10 as u8];
 
@@ -187,7 +187,7 @@ fn main() {
             ("GET", "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
             ("GET", "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
             ("GET", "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
-            ("POST","/api/belgrade/documents/")          => handle_post(&request, &mut db, &config.content_root_dir),
+            ("POST","/api/belgrade/documents")          => handle_post(&request, &mut db, &config.content_root_dir),
             _                                           => NOT_IMPLEMENTED,
         };
 
@@ -432,18 +432,18 @@ fn handle_query(request: &HttpRequest, db: &mut Client, queries: &HashMap<String
     debug_println!("Query: {} Filter: {} Processed datetimes --- From: {:?} To: {:?}", query, filter, from_datetime, to_datetime);
     
     // Everything has been extracted and processed. Ready for database query
-    const BASE_REQUEST: &str = r#"WITH r AS (SELECT CASE WHEN (e.customer = '') IS NOT FALSE THEN c.pdf_datetime ELSE e.pdf_datetime END, pdf_num, CASE WHEN (e.customer <> '') IS NOT FALSE THEN c.customer ELSE e.customer END, relative_path, "dt_path" FROM ( SELECT pdf_datetime, pdf_num, customer, relative_path FROM pdfs WHERE pdf_type = 1 ) AS e FULL JOIN ( SELECT pdf_num, pdf_datetime, customer, relative_path AS "dt_path" FROM pdfs WHERE pdf_type = 2 ) AS c USING (pdf_num)) SELECT * FROM r WHERE pdf_datetime BETWEEN $1 AND $2"#;
+    const BASE_REQUEST: &str = r#"WITH r AS ( SELECT CASE WHEN (e.customer = '') THEN c.pdf_datetime ELSE e.pdf_datetime END, pdf_num, CASE WHEN (e.customer = '') THEN c.customer ELSE e.customer END, relative_path, "dt_path" FROM ( SELECT pdf_datetime, pdf_num, customer, relative_path FROM pdfs WHERE pdf_type = 1 ) AS e FULL JOIN ( SELECT pdf_num, pdf_datetime, customer, relative_path AS "dt_path" FROM pdfs WHERE pdf_type = 2 ) AS c USING (pdf_num) ) SELECT * FROM r WHERE pdf_datetime BETWEEN $1 AND $2"#;
     // const BASE_REQUEST: &str = "SELECT pdf_datetime, pdf_type, pdf_num, customer, relative_path FROM pdfs WHERE pdf_datetime BETWEEN $1 AND $2";
     let full_query = match filter.as_str() {
         "Customer" => {
-            format!("{} AND customer ILIKE '%{}%' ORDER BY pdf_num;", BASE_REQUEST, query)
+            format!("{} AND customer ILIKE '%{}%' ORDER BY pdf_num DESC;", BASE_REQUEST, query)
         }
         "Number" => {
             let num = if let Ok(number) = query.parse::<u32>() { number } else { return BAD_REQUEST.clone_with_message("A valid number was not included in the search".to_string())};
             format!("{} AND pdf_num = {};", BASE_REQUEST, num )
         },
         _ => { 
-            format!("{} AND relative_path ILIKE '%{}%' ORDER BY pdf_num;", BASE_REQUEST, query)
+            format!("{} AND relative_path ILIKE '%{}%' ORDER BY pdf_num DESC;", BASE_REQUEST, query)
         }
     };
     
