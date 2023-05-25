@@ -15,6 +15,18 @@ mod http;
 mod config_parser;
 use crate::http::*;
 
+// Need to have server status. Like shutting down.
+pub fn signal_handler() {
+    // The signal handler will often either add a task to the thread pool or
+    // Simply return information the server is using to process things
+}
+
+pub fn run() {
+    loop {
+        // Dequeue & Run tasks in thread pool
+    }
+}
+
 
 // RUST WEBSERVER CONSTANTS
 const CONFIG_PATH: &str = "/var/www/redimix/backend/data/config.ini";
