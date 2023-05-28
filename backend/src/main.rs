@@ -1,10 +1,11 @@
-use std::{env, path::PathBuf, process, fs::{File, self}, error};
+use std::{env, path, process, fs, error, io, default, f32::consts::PI};
 use log::{trace, debug, info, warn, error};
-use simplelog::{WriteLogger, LevelFilter, Config};
+use simplelog;
 use serde::{Serialize, Deserialize};
 const LOG_FILE: &str = "rmc.log";
 const SERVER_FILE: &str = "server_status";
 const EXECUTABLE_NAME: &str = "rmc";
+
 #[derive(Debug)]
 enum Error {
     ServerAlreadyStarted(ServerStatus),
@@ -30,7 +31,7 @@ impl std::fmt::Display for Error {
 
 }
 
-impl std::error::Error for Error {}
+impl error::Error for Error {}
 
 /// The intended method for a first time user is as follows
 /// 
@@ -45,14 +46,14 @@ impl std::error::Error for Error {}
 
 #[tokio::main]
 async fn main() {
-    let log = File::options()
+    let log = fs::File::options()
         .append(true)
         .create(true)
         .open(LOG_FILE)
         .expect("Could not create log file");
-    WriteLogger::init(
-        LevelFilter::Info, 
-        Config::default(),
+    simplelog::WriteLogger::init(
+        simplelog::LevelFilter::Info, 
+        simplelog::Config::default(),
         log
     ).expect("Could not initialize logger");
     
@@ -64,7 +65,7 @@ async fn main() {
             "run" => server_run(),
             "stop" => server_stop(),
             "status" => server_status(),
-            "backup" => server_backup(),
+            "backup" => server_backup(&cmdline_args),
             _ => help(),
         };
         if let Err(error) = result {
@@ -82,7 +83,7 @@ fn help() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[repr(u8)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum DataCategories {
     All,
     TicketMetadata,
@@ -92,15 +93,67 @@ enum DataCategories {
     Logs,
 }
 
+#[derive(Serialize, Deserialize)]
+struct Config {
+    backup_options: Option<BackupOptions>,
+}
+
+impl default::Default for Config {
+    fn default() -> Self {
+        Config {
+            backup_options: Some(BackupOptions::default()),
+        }
+    }
+}
+
+impl Config {
+    const USER_PATH: &str = ".config/rmc";
+    const SHARED_PATH: &str = "/etc/xdg/rmc";
+    const FILENAME: &str = "rmc.conf";
+
+    fn user() -> Result<Config, Box<dyn error::Error>> {
+        // TODO: Should create this folder if it does not exist
+        let home = env::var("HOME")?;
+        let result = fs::create_dir_all(Config::USER_PATH);
+        let user_config_file = format!("{}/{}/{}", home, Config::USER_PATH, Config::FILENAME);
+        let user_config = fs::File::open(user_config_file)?;
+        let user_config_reader = io::BufReader::new(user_config);
+        let config: Config = serde_json::from_reader(user_config_reader)?; 
+        return Ok(config);
+    }
+
+    fn shared() -> Result<Config, Box<dyn error::Error>> {
+        // TODO: Should create this folder if it does not exist
+        let result = fs::create_dir_all(Config::SHARED_PATH);
+        let shared_config_file = format!("{}/{}", Config::SHARED_PATH, Config::FILENAME);
+        let shared_config = fs::File::open(shared_config_file)?;
+        let shared_config_reader = io::BufReader::new(shared_config);
+        let config: Config = serde_json::from_reader(shared_config_reader)?; 
+        return Ok(config);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct BackupOptions {
-    output_file: PathBuf,
-    data: DataCategories,
-    from_date: String, // TODO: Date should be a struct
-    to_date: String, 
+    output_file: Option<path::PathBuf>,
+    data: Option<DataCategories>,
+    from_date: Option<String>, // TODO: Date should be a struct
+    to_date: Option<String>,
+}
+
+impl default::Default for BackupOptions {
+    fn default() -> Self {
+        return BackupOptions {
+            output_file: Some(path::PathBuf::from("rmc-server-backup.bkp")),
+            data: Some(DataCategories::All),
+            from_date: Some(String::new()),
+            to_date: Some(String::new()),
+        }    
+    }
 }
 
 impl BackupOptions {
-    pub fn new() -> BackupOptions {
+    pub fn parse() -> BackupOptions {
         let mut output_file = env::current_dir()
             .expect("Could not read the current directory");
         output_file.push("backup.tar.gz");
@@ -108,7 +161,48 @@ impl BackupOptions {
         let from_date = String::new();
         let to_date = String::new();
 
-        return BackupOptions{output_file, data, from_date, to_date};
+        return BackupOptions{
+            output_file: Some(output_file), 
+            data: Some(data), 
+            from_date: Some(from_date), 
+            to_date: Some(to_date)
+        };
+    }
+
+
+    pub fn retrieve(args: Option<&Vec<String>>) -> BackupOptions {
+        let mut backup_options = BackupOptions::default(); 
+        let shared_config = Config::shared();
+        match shared_config {
+            Ok(config) => backup_options.update(&config),
+            Err(error) => warn!("Could not read from the shared config: {}", error.to_string()),
+        }
+
+        let user_config = Config::user();
+        match user_config {
+            Ok(config) => backup_options.update(&config),
+            Err(error) => warn!("Could not read from the shared config: {}", error.to_string()),
+        }
+
+        return backup_options;
+    }
+
+    //
+    fn update(&mut self, new_config: &Config) {
+        if let Some(backup_options) = &new_config.backup_options {
+            if let Some (data) = &backup_options.data {
+                self.data = Some(data.clone());
+            }
+            if let Some(from_date) = &backup_options.from_date {
+                self.from_date = Some(from_date.clone());
+            }
+            if let Some(to_date) = &backup_options.to_date {
+                self.to_date = Some(to_date.clone());
+            }
+            if let Some(output_file) = &backup_options.output_file {
+                self.output_file = Some(output_file.clone());
+            }
+        }
     }
 }
 
@@ -145,13 +239,15 @@ struct ServerStatus {
     state: ServerState,    
 }
 
+impl default::Default for ServerStatus {
+    fn default() -> Self {
+        return ServerStatus {
+            state: ServerState::Stopped
+        };
+    }
+}
+
 impl ServerStatus {
-   
-    /// The DEFAULT values for a server 
-    const DEFAULT: ServerStatus = ServerStatus {
-        state: ServerState::Stopped
-    };
-    
     pub fn store(&self) -> Result<(), Box<dyn error::Error>> {
         let json_string = serde_json::to_string(self)?;
         fs::write(SERVER_FILE, json_string)?;
@@ -173,7 +269,7 @@ impl ServerStatus {
             let x = values.get(0).unwrap();
             let y = values.get(1).unwrap();
         }
-        return Ok(ServerStatus::DEFAULT); // TODO: This should be the parsed data, not default
+        return Ok(ServerStatus::default()); // TODO: This should be the parsed data, not default
     }
 }
 
@@ -195,31 +291,14 @@ fn server_status() -> Result<(), Box<dyn error::Error>> {
 }
 
 /// Creates a backup of the server with some optional arguments
-fn server_backup() -> Result<(), Box<dyn error::Error>> {
-    dbg!("Backing up server");
-    let backup_options = config_get_backup_options();
+fn server_backup(args: &Vec<String>) -> Result<(), Box<dyn error::Error>> {
+    info!("Creating a backup");
+    let mut backup_options = BackupOptions::retrieve(Some(args));
+   
     // Perform the backup
     Ok(())
 }
 
-
-/// Set options based on the config
-fn config_get_backup_options() -> BackupOptions {
-    // Set the default options, override them with options provided in the
-    let mut backup_options = BackupOptions::new();
-    let home = env::var("HOME").expect("Could not find $HOME environment variable");
-    // TODO: Have these use paths based on XDG environment variables instead of
-    // absolute paths
-    let shared_config_file = PathBuf::from("/usr/share/rmc/rmc.conf");
-    let user_config_file = PathBuf::from(format!("{}/.config/rmc/rmc.conf", home));
-    
-    update_backup_options(&mut backup_options, &shared_config_file);
-    update_backup_options(&mut backup_options, &user_config_file);
-    // TODO: Implement actual backing up of data using sanitized sql queries
-
-    return backup_options;
-}
-
-fn update_backup_options(options: &mut BackupOptions, path: &PathBuf) {
+fn update_backup_options(options: &mut BackupOptions, path: &path::PathBuf) {
     // TODO: Implement config parsing in order to set backup
 }
