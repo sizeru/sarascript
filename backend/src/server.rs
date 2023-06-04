@@ -375,7 +375,7 @@ pub async fn run() -> Result<(), Box<dyn error::Error>> {
                         .write(true)
                         .mode(0o440)
                         .open(&pid_filename).unwrap();
-                    pid_file.write(process::id().to_string().as_bytes())?;
+                    pid_file.write(format!("{}\n", process::id()).as_bytes())?;
                     // File closed upon leaving scope
                 },
                 _ => {
