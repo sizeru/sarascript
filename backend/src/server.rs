@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs::{File, self};
-use std::io::{prelude::*, BufReader};
+use std::io::{prelude::*, BufReader, self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::env::{self, current_dir};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::GMTPlus4;
@@ -11,19 +12,388 @@ use crc::Crc;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls, GenericClient};
 use pwhash::sha512_crypt;
-mod http;
-mod config_parser;
-use crate::http::*;
+use crate::{http, config_parser, http::*, get_server_status, server};
+// The following use statements were made after the cmdutil refactor
+use signal_hook::{consts::*};
+use signal_hook_tokio::Signals;
+use std::thread;
+use std::os::unix::net::{UnixStream, UnixListener, UnixDatagram};
+use futures_util::StreamExt;
 
-// Need to have server status. Like shutting down.
-pub fn signal_handler() {
-    // The signal handler will often either add a task to the thread pool or
-    // Simply return information the server is using to process things
+
+use std::{process, error, default};
+use log::{trace, debug, info, warn, error};
+use simplelog;
+use chrono;
+use serde::{Serialize, Deserialize};
+use const_format::formatcp;
+use std::os::unix::fs::*;
+
+pub const SERVER_FILE: &str = "server_status";
+pub const EXECUTABLE_NAME: &str = "rmc";
+
+#[derive(Debug)]
+pub enum Error {
+    ServerAlreadyStarted(ServerStatus),
+    MissingServerFile,
+    CannotFindExecutable,
+    InaccessibleSharedConfig(Box<dyn error::Error>),
+    InaccessibleUserConfig(Box<dyn error::Error>),
+    MalformedCmdline(String),
+    InvalidIPCReponse(IPCResponse, IPCResponse),
+    CouldNotConnectToSocket(Box<dyn error::Error>),
+    CouldNotStartSignalHandler(Box<dyn error::Error>),
+    CouldNotStartIPCHandler(Box<dyn error::Error>),
+    NoHomeEnvironmentVariable,
 }
 
-pub fn run() {
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::ServerAlreadyStarted(current_status) => {
+                write!(f, "cannot start a server that is already running. 
+                    Server status at time of command: {}", current_status.to_string())
+            },
+            Error::MissingServerFile => {
+                write!(f, "Could not find server file `{}` in working directory: {}", SERVER_FILE, env::current_dir().unwrap().display())
+            },
+            Error::CannotFindExecutable => {
+                write!(f, "Could not find executable `{}` in working directory: {}", EXECUTABLE_NAME, env::current_dir().unwrap().display())
+            },
+            Error::InaccessibleSharedConfig(souce_error) => {
+                write!(f, "Could not access the shared config. Reason: {}", souce_error.to_string())
+            },
+            Error::InaccessibleUserConfig(source_error) => {
+                write!(f, "Could not access the user config. Reason: {}", source_error.to_string())
+            },
+            Error::MalformedCmdline(token) => {
+                write!(f, "`{}` is not a valid token", token)
+            },
+            Error::InvalidIPCReponse(expected, actual) => {
+                write!(f, "IPC (Inter-Process Communication) Response was invalid. Expected: {:?}. Received: {:?}", expected, actual)
+            },
+            Error::CouldNotStartSignalHandler(source_error) => {
+                write!(f, "Could not initialize the signal handler. Reason: {}", source_error.to_string())
+            },
+            Error::CouldNotStartIPCHandler(source_error) => {
+                write!(f, "Could not initialize the IPC handler. If this is because of a missing file, it can sometimes be fixed by running `rmc server repair`. Reason: {}", source_error.to_string())
+            },
+            Error::NoHomeEnvironmentVariable => {
+                write!(f, "Could not find $HOME")
+            },
+            Error::CouldNotConnectToSocket(source_error) => {
+                write!(f, "Could not connect to socket file. Reason: {}", source_error.to_string())
+            },
+        } 
+    }
+
+}
+
+impl error::Error for Error {}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub enum IPCCommand {
+    GetStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum IPCResponse {
+    CannotConnect,
+    Status(ServerStatus),
+}
+
+pub struct Server {
+
+}
+
+impl Server {
+    pub async fn exec_ipc_message(command: &IPCCommand) -> Result<IPCResponse, Box<dyn error::Error>> {
+        let socket = UnixDatagram::unbound()?;
+        let socket_file = Server::socket_file()?;
+        if let Err(error) = socket.connect(socket_file) {
+            match error.kind() {
+                io::ErrorKind::NotFound => {
+                    return Ok(IPCResponse::CannotConnect);
+                },
+                _ => {
+                    return Err(Box::new(Error::CouldNotConnectToSocket(Box::new(error))));
+                }
+            }
+        }
+        let string = serde_json::to_string(command)?;
+        socket.send(string.as_bytes())?;
+
+        let mut buffer = vec![0u8; 4096];
+        let bytes_read = socket.recv(&mut buffer)?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&buffer);
+        let response = IPCResponse::deserialize(&mut deserializer)?;
+        return Ok(response); 
+    }
+    /// Returns the status of the server.
+    pub async fn status() -> Result<ServerStatus, Box<dyn error::Error>> {
+        const SOCKET_FILE: &str = "socket"; 
+        let runtime_dir = Server::runtime_dir()?;
+        let socket_file = format!("{}/{}", runtime_dir, SOCKET_FILE);
+        let unix_stream = UnixStream::connect(socket_file);
+        match unix_stream {
+            Ok(mut stream) => {
+                // TODO: This data will never be read by a human, so I would
+                // prefer using a binary format for the serialized data, 
+                // rather than JSON
+                let command = IPCCommand::GetStatus;
+                let string = serde_json::to_string(&command)?;
+                stream.write_all(string.as_bytes())?;
+                let mut deserializer = serde_json::Deserializer::from_reader(stream);
+                let response = IPCResponse::deserialize(&mut deserializer)?;
+                if let IPCResponse::Status(server_status) = response {
+                    return Ok(server_status);
+                } else {
+                    return Err(Box::new(Error::InvalidIPCReponse(IPCResponse::Status(ServerStatus::default()), response)));
+                }
+            },
+            Err(error) => {
+                // TODO: This does not necessarily mean that the server is
+                // dead, but for now we are going to INCORRECTLY assume that 
+                // it does. This is an important fix.
+                info!("Could not read Unix Domain socket due to error: {}", error.to_string());
+                warn!(concat!("This does not necessarily mean that the server ",
+                    "is not running. This feature is not fully implemented. ",
+                    "It is wise to check manually if the server is still ",
+                    "around."));
+                let status = ServerStatus {
+                    state: ServerState::Stopped,
+                };
+                return Ok(status); 
+            }
+        }
+        // Connect to socket
+        // send message
+        // wait for response
+        // Return response
+        unimplemented!();
+    }
+
+    /// Used for config files that are shared across the whole system
+    pub const SYSTEM_CONFIG_DIR: &str = "/etc/rmc";
+
+    pub fn pid_file() -> Result<String, Box<dyn error::Error>> {
+        let runtime_dir = Server::runtime_dir()?;
+        return Ok(format!("{}/pid", runtime_dir));
+    }
+
+    pub fn socket_file() -> Result<String, Box<dyn error::Error>> {
+        let runtime_dir = Server::runtime_dir()?;
+        return Ok(format!("{}/socket", runtime_dir));
+    }
+
+    /// Used for runtime files like sockets and PIDs
+    pub fn runtime_dir() -> Result<String, Box<dyn error::Error>> { 
+        return Ok("/tmp/rmc".to_string());
+        // match env::var("XDG_RUNTIME_DIR") {
+            // Ok(xdg_runtime_dir) => {
+                // return Ok(format!("{}/rmc", xdg_runtime_dir));
+            // },
+            // Err(error) => {
+                // todo!("Implement fallback directory if there is no $XDG_RUNTIME_DIR");
+            // }
+        // };
+    }
+
+    /// Returns a directory where user config files are stored
+    pub fn user_config_dir() -> Result<String, Box<dyn error::Error>> { 
+        match env::var("XDG_CONFIG_HOME") {
+            Ok(xdg_config_home) => {
+                return Ok(format!("{}/rmc", xdg_config_home));
+            },
+            Err(error) => {
+                match env::var("HOME") {
+                    Ok(home) => {
+                        return Ok(format!("{}/.config/rmc", home));
+                    },
+                    Err(error) => {
+                        return Err(Box::new(Error::NoHomeEnvironmentVariable));
+                    },
+                };
+            }
+        };
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerState {
+    Placeholder,
+    Unreachable,
+    Stopped,
+    Starting,
+    Running,
+    Terminating,
+}
+
+// TODO: Implement a formatter for ServerStatus
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct ServerStatus {
+    pub state: ServerState,    
+}
+
+impl default::Default for ServerStatus {
+    fn default() -> Self {
+        return ServerStatus {
+            state: ServerState::Unreachable
+        };
+    }
+}
+
+impl ServerStatus {
+    pub const UNREACHABLE: ServerStatus = ServerStatus {
+        state: ServerState::Unreachable,
+    };
+
+    pub fn store(&self) -> Result<(), Box<dyn error::Error>> {
+        let json_string = serde_json::to_string(self)?;
+        fs::write(SERVER_FILE, json_string)?;
+        return Ok(());
+    }
+
+    pub fn print(&self) {
+        println!("{}", self.to_string());
+    }
+
+    pub fn to_string(&self) -> String {
+        return "Unimplemented!".to_string();
+    }
+
+    pub fn parse() -> Result<ServerStatus, Box<dyn error::Error>> {
+        let status_file = fs::read_to_string(SERVER_FILE)?;
+        for line in status_file.lines() {
+            let values: Vec<&str> = line.split('=').collect();
+            let x = values.get(0).unwrap().as_ptr();
+            let y = values.get(1).unwrap();
+        }
+        return Ok(ServerStatus::default()); // TODO: This should be the parsed data, not default
+    }
+}
+
+fn init_signal_handler() -> Result<(), Box<dyn std::error::Error>> {
+    let signals = Signals::new(&[
+        SIGINT, SIGTERM, SIGHUP,
+    ])?;
+    let handle = signals.handle();
+    let signal_handler = tokio::spawn(signal_handler(signals));
+    return Ok(());
+}
+
+async fn signal_handler(mut signals: Signals) {
+    // The signal handler will often either add a task to the thread pool or
+    // Simply return information the server is using to process things
+    while let Some(signal) = signals.next().await {
+        match signal {
+            SIGHUP => {
+                todo!("Reload the configuration file");
+            }
+            SIGTERM | SIGINT => {
+                println!("Should shutdown the server gracefully");
+                let runtime_dir = Server::runtime_dir().unwrap();
+                fs::remove_dir_all(runtime_dir).unwrap();
+                println!("Deleted the runtime directory");
+                std::process::exit(1);
+            },
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Creates a server which will handle inter-process communication
+fn init_ipc_server() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_dir = Server::runtime_dir()?;
+    println!("pre bind listener");
+    let listener = UnixListener::bind(format!("{}/socket", runtime_dir))?;
+    let ipc_thread = tokio::spawn(ipc_handler(listener));
+    Ok(())
+}
+
+async fn ipc_handler(listener: UnixListener) {
+    dbg!("Checkpoint");
+    // accept connections and process them, spawning a new thread for each one
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                println!("Connected!");
+                let mut buffer = vec![0u8; 4096];
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                let mut deserializer = serde_json::Deserializer::from_slice(&buffer);
+                let command = IPCCommand::deserialize(&mut deserializer).unwrap();
+
+                let response: IPCResponse = match command {
+                    IPCCommand::GetStatus => {
+                        // TODO: Running is just a placeholder. This should return the actual server status
+                        IPCResponse::Status(ServerStatus { state: ServerState::Placeholder })
+                    },
+                };
+                let string = serde_json::to_string(&response).unwrap();
+                stream.write(string.as_bytes()).unwrap();
+                println!("Dispatch completed");
+            }
+            Err(err) => {
+                /* connection failed */
+                println!("Connection failed for some reason: {}", err.to_string());
+                break;
+            }
+        }
+    }
+}
+
+/// Runs the server inside of the current process. No daemon. 
+pub async fn run() -> Result<(), Box<dyn error::Error>> { 
+    {
+        let runtime_dir = Server::runtime_dir()?;
+        match fs::metadata(&runtime_dir) { // Used to check if path exists {
+            Ok(_) => {
+                // TODO: This branch needs work. If there is a valid server 
+                // status, that means the server is running somehow. Else, the 
+                // server failed to shut down properly
+                println!(concat!("Trying to start the server, but the runtime ",
+                    "directory already exists. This means that the server is ",
+                    "either still running, or did not shut down correctly. ",
+                    "Sometimes a call to `rmc repair` can fix this."));
+                let server_status = get_server_status().await?;
+                return Err(Box::new(Error::ServerAlreadyStarted(server_status)));
+            }
+            Err(error) => match error.kind() {
+                io::ErrorKind::PermissionDenied => {
+                    println!("Could not access the server's runtime directory. The server may have been started by another user.");
+                    return Err(Box::new(error));
+                },
+                io::ErrorKind::NotFound => { // The desired case. Create the directory with the correct permissions
+                    fs::DirBuilder::new()
+                        .recursive(false)
+                        .mode(0o770)
+                        .create(&runtime_dir)
+                        .unwrap();
+                    let pid_filename = Server::pid_file()?;
+                    let mut pid_file = fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .mode(0o440)
+                        .open(&pid_filename).unwrap();
+                    pid_file.write(process::id().to_string().as_bytes())?;
+                    // File closed upon leaving scope
+                },
+                _ => {
+                    return Err(Box::new(error));
+                }
+            }
+        }
+    }
+    if let Err(error) = init_signal_handler() {
+        return Err(Box::new(Error::CouldNotStartSignalHandler(error))); 
+    }
+    if let Err(error) = init_ipc_server() {
+        return Err(Box::new(Error::CouldNotStartIPCHandler(error)));
+    }
+    // Tell parent that you were succesful
     loop {
         // Dequeue & Run tasks in thread pool
+
     }
 }
 

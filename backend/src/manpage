@@ -22,17 +22,17 @@ COMMANDS
         print out the most recent logs that the server has recorded. How many logs are printed can be in the config
 
     backup [options]
-        -o [filename], --output-file=[filename]
+        --output-file=[filename]
             choose the name of the output file. Default is rmc-backup-[date].tar.gz
         
-        -d [data to backup], --data=[data to backup]
+        --data=[data to backup]
             Choose what type of data to backup. If no option is specified, will backup all data. Backup data options are:
                 ticket-metadata, ticket-pdfs, weight-metadata, weights-pdfs, logs
 
-        -f [yyyy-MM-DD], --from-date=[yyyy-MM-DD]
+        --from-date=[yyyy-MM-DD]
             Choose what date to begin backing up from. Inclusive. If no option specified, will try to backup all data before the to-date
 
-        -t [yyyy-MM-DD], --to-date=[yyyy-MM-DD]
+        --to-date=[yyyy-MM-DD]
             Choose which data to end backing up at. Inclusive. If no option specified, will backup all after the from-date.
 
 CONFIG

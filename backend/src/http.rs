@@ -1,7 +1,7 @@
 use std::io::prelude::*;
 use std::net::TcpStream;
 use std::collections::{HashMap};
-use crate::Body::{Single}; //NOTE: See [2]
+use crate::http::Body::{Single}; //NOTE: See [2]
 
 // HTTP Response Codes
 pub const BAD_REQUEST: Response = Response{code:"400 Bad Request", headers:None, message:None} ;
@@ -340,7 +340,7 @@ fn get_http_line(stream: &mut TcpStream, request_buffer: &mut RequestBuffer, lin
 fn parse_control_data_line (line_buffer: &LineBuffer) -> Result<HttpRequest, Response> {
     let line = &line_buffer.buffer[..line_buffer.size];
     let line = String::from_utf8(line.to_vec());
-    if let Err(FromUtf8Error) = line {
+    if let Err(error) = line {
         return Err(BAD_REQUEST.clone_with_message("Control Line contained not UTF-8 characters".to_string()));
     }
     let line = line.unwrap();
@@ -398,7 +398,7 @@ pub fn parse_location(location_line: &String) -> Result<(String, HashMap<String,
 fn parse_header_line<'a> (line_buffer: &LineBuffer) -> Result<(String, String), Response> {
     let line = &line_buffer.buffer[..line_buffer.size];
     let line = String::from_utf8(line.to_vec());
-    if let Err(FromUtf8Error) = line {
+    if let Err(error) = line {
         return Err(BAD_REQUEST.clone_with_message("A header line contained not UTF-8 characters".to_string()));
     }
     let line = line.unwrap();
