@@ -11,7 +11,7 @@ mod server;
 mod http;
 mod config_parser;
 
-const LOG_FILE: &str = "rmc.log";
+const LOG_FILE: &str = "/var/log/rmc/log";
 
 /// The intended method for a first time user is as follows
 /// 
@@ -202,7 +202,7 @@ async fn server_start() -> Result<(), Box<dyn error::Error>> {
     if status.state != ServerState::Stopped && status.state != ServerState::Unreachable {
         return Err(Box::new(Error::ServerAlreadyStarted(status)));
     }
-    let daemon  = process::Command::new("target/debug/rmc")
+    let daemon  = process::Command::new("rmc")
         .arg("run")
         .spawn()?;
     info!("Preparing to daemonize server");
@@ -214,6 +214,7 @@ async fn server_start() -> Result<(), Box<dyn error::Error>> {
 /// Checks on the status of the server. If the server status file cannot be found, 
 async fn get_server_status() -> Result<ServerStatus, Box<dyn error::Error>> {
     let response = Server::exec_ipc_message(&IPCCommand::GetStatus).await?;
+    println!("Got response");
     match response {
         IPCResponse::Status(server_status) => {
             return Ok(server_status);
@@ -237,9 +238,9 @@ async fn get_server_status() -> Result<ServerStatus, Box<dyn error::Error>> {
 async fn server_stop() -> Result<(), Box<dyn error::Error>> {
     info!("Sending signal to stop server");
     let pid_file = Server::pid_file()?;
-    let contents = fs::read(pid_file)?;
-    let read_contents = String::from_utf8(contents)?;
-    let pid = read_contents.parse::<usize>()?;
+    let contents = fs::read_to_string(pid_file)?;
+    println!("pid: {}", contents);
+    let pid = contents.parse::<usize>()?;
     
     let result = process::Command::new("kill")
         .arg("-s")

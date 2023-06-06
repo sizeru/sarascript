@@ -108,9 +108,11 @@ pub struct Server {
 
 impl Server {
     pub async fn exec_ipc_message(command: &IPCCommand) -> Result<IPCResponse, Box<dyn error::Error>> {
-        let socket = UnixDatagram::unbound()?;
         let socket_file = Server::socket_file()?;
-        if let Err(error) = socket.connect(socket_file) {
+        let socket = UnixStream::connect(socket_file);
+        println!("Connected");
+        if let Err(error) = socket {
+            println!("Uh oh");
             match error.kind() {
                 io::ErrorKind::NotFound => {
                     return Ok(IPCResponse::CannotConnect);
@@ -120,11 +122,12 @@ impl Server {
                 }
             }
         }
+        let mut socket = socket.unwrap();
         let string = serde_json::to_string(command)?;
-        socket.send(string.as_bytes())?;
+        socket.write(string.as_bytes())?;
 
         let mut buffer = vec![0u8; 4096];
-        let bytes_read = socket.recv(&mut buffer)?;
+        let bytes_read = socket.read(&mut buffer)?;
         let mut deserializer = serde_json::Deserializer::from_slice(&buffer);
         let response = IPCResponse::deserialize(&mut deserializer)?;
         return Ok(response); 
@@ -375,7 +378,7 @@ pub async fn run() -> Result<(), Box<dyn error::Error>> {
                         .write(true)
                         .mode(0o440)
                         .open(&pid_filename).unwrap();
-                    pid_file.write(format!("{}\n", process::id()).as_bytes())?;
+                    pid_file.write(process::id().to_string().as_bytes())?;
                     // File closed upon leaving scope
                 },
                 _ => {
@@ -390,11 +393,16 @@ pub async fn run() -> Result<(), Box<dyn error::Error>> {
     if let Err(error) = init_ipc_server() {
         return Err(Box::new(Error::CouldNotStartIPCHandler(error)));
     }
+    
+    // This pretends that the thread continues
+    std::thread::sleep(std::time::Duration::from_secs(300));
     // Tell parent that you were succesful
-    loop {
+    Ok(())
+
+    // loop {
         // Dequeue & Run tasks in thread pool
 
-    }
+    // }
 }
 
 
