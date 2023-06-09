@@ -1,18 +1,21 @@
-use std::{env, process, fs, error, io::{self, BufReader}, default, os::unix::net::{UnixDatagram, UnixStream}, string};
-use log::{trace, debug, info, warn, error};
+use std::{env, process, fs, error, io, default};
+use log::{info, warn}; // TODO: Add appropriate trace, debug, error logs
 use simplelog;
 use chrono;
-use serde::{Serialize, Deserialize, Serializer};
+use serde::{Serialize, Deserialize};
 use std::os::unix::fs::DirBuilderExt;
 use server::{ServerState, ServerStatus, Server, Error};
-
 use crate::server::{IPCCommand, IPCResponse};
 mod server;
 mod http;
 mod config_parser;
 
-const LOG_FILE: &str = "/var/log/rmc/log";
+const LOG_FILE: &str = "/var/log/rmc/rmc.log";
 
+/// This comment is outdated. Right now there is an install script
+/// and chances are the server should be run as a daemon using
+/// systemctl most times:
+///  
 /// The intended method for a first time user is as follows
 /// 
 /// ```
@@ -43,12 +46,13 @@ async fn main() {
         let result = match function.as_str() {
             "start" => server_start().await,
             "run" => server::run().await,
-            "stop" => server_stop().await,
+            "stop" => server_stop(&cmdline_args).await,
             "status" => server_status().await,
             "backup" => server_backup(&cmdline_args).await,
             "user" => server_user(&cmdline_args).await,
             "create" => server_create().await,
-            _ => help(),
+            "help" => help(),
+            _ => Err(Box::new(Error::UnknownUsage(cmdline_args.iter().map(|x| format!("{} ", x)).collect::<String>())).into()),
         };
         if let Err(error) = result {
             println!("Error: {}", error.to_string());
@@ -61,7 +65,7 @@ async fn main() {
 
 /// Display the help page
 fn help() -> Result<(), Box<dyn error::Error>> {
-    debug!("Command not recognized. display help page");
+    println!("Help page summoned. TODO: Add a help page");
     Ok(())
 }
 
@@ -202,19 +206,33 @@ async fn server_start() -> Result<(), Box<dyn error::Error>> {
     if status.state != ServerState::Stopped && status.state != ServerState::Unreachable {
         return Err(Box::new(Error::ServerAlreadyStarted(status)));
     }
-    let daemon  = process::Command::new("rmc")
+    process::Command::new("rmc")
         .arg("run")
+        // .stdout(process::Stdio::piped())
         .spawn()?;
-    info!("Preparing to daemonize server");
-    // Open pipe from child to read the PID 
-    // TODO: wait for signal from child that server has been started succesfully.
+    println!("Daemon spawned");
+
+    // TODO: It would be nice for the spawned daemon to signal to the parent
+    // that it started succesfully. Although, since this is intended to be a
+    // systemd daemon, the `run` command will likely be preferred to the
+    // `start` command. This function is likely to be for testing only.
+
+    // let mut child_output = io::BufReader::new(daemon.stdout.as_mut().take().unwrap());
+    // let mut output_line = String::new();
+    // println!("Prepared a reader");
+    // let bytes_read = child_output.read_to_string(&mut output_line)?;
+    // println!("Read {bytes_read} bytes");
+    // if output_line.eq(Server::STARTING_MESSAGE) {
+    //     return Ok(())
+    // } else {
+    //     return Err(Error::CouldNotStartServer(output_line).into());
+    // }
     return Ok(());
 }
 
 /// Checks on the status of the server. If the server status file cannot be found, 
 async fn get_server_status() -> Result<ServerStatus, Box<dyn error::Error>> {
     let response = Server::exec_ipc_message(&IPCCommand::GetStatus).await?;
-    println!("Got response");
     match response {
         IPCResponse::Status(server_status) => {
             return Ok(server_status);
@@ -222,9 +240,10 @@ async fn get_server_status() -> Result<ServerStatus, Box<dyn error::Error>> {
         IPCResponse::CannotConnect => {
             return Ok(ServerStatus::UNREACHABLE);
         },
-        _ => { 
-            return Err(Box::new(Error::InvalidIPCReponse(IPCResponse::Status(ServerStatus::default()), response))); 
-        }
+        // This is unreachable
+        // _ => { 
+        //     return Err(Box::new(Error::InvalidIPCReponse(IPCResponse::Status(ServerStatus::default()), response))); 
+        // }
     }
     // todo!("Check for the socket file. If not present. Check for the heartbeat file.
     // Socket => query the status over the socket. If this fails go to another branch
@@ -235,14 +254,35 @@ async fn get_server_status() -> Result<ServerStatus, Box<dyn error::Error>> {
 }
 
 /// Safely stop the server after the last process is complete.
-async fn server_stop() -> Result<(), Box<dyn error::Error>> {
+async fn server_stop(cmdline_args: &Vec<String>) -> Result<(), Box<dyn error::Error>> {
     info!("Sending signal to stop server");
     let pid_file = Server::pid_file()?;
     let contents = fs::read_to_string(pid_file)?;
     println!("pid: {}", contents);
     let pid = contents.parse::<usize>()?;
+
+    if let Some(flag) = cmdline_args.get(2) {
+        if flag.eq("--force") {
+            let result = process::Command::new("kill")
+                .arg("-s")
+                .arg("SIGKILL")
+                .arg(pid.to_string())
+                .output();
+            match result {
+                Ok(output) => {
+                    let runtime_dir = Server::runtime_dir().unwrap();
+                    fs::remove_dir_all(runtime_dir).unwrap();
+                    println!("Forced closed and manually cleaned up runtime files.\n{:?}", output);
+                    return Ok(())
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Err(Box::new(Error::UnknownUsage(cmdline_args.iter().map(|x| format!("{} ", x)).collect::<String>())))
+    } 
     
-    let result = process::Command::new("kill")
+    println!("Sending");
+    process::Command::new("kill")
         .arg("-s")
         .arg("SIGINT")
         .arg(pid.to_string())
@@ -254,17 +294,17 @@ async fn server_stop() -> Result<(), Box<dyn error::Error>> {
 async fn server_status() -> Result<(), Box<dyn error::Error>> {
     warn!("Checking server status");
     let status = get_server_status().await?;
-    println!("{:?}", status);
+    println!("{}", status);
     Ok(())
 }
 
 /// Creates a backup of the server with some optional arguments
 async fn server_backup(args: &Vec<String>) -> Result<(), Box<dyn error::Error>> {
-    let backup_options = BackupOptions::retrieve(Some(args))?;
-    info!("Creating a backup at: {}", backup_options.output_file.unwrap());
     todo!("Implement");
-    // Perform the backup
-    Ok(())
+    // let backup_options = BackupOptions::retrieve(Some(args))?;
+    // info!("Creating a backup at: {}", backup_options.output_file.unwrap());
+    // // Perform the backup
+    // Ok(())
 }
 
 /// Create files needed for a new server
@@ -290,5 +330,9 @@ async fn server_create() -> Result<(), Box<dyn error::Error>> {
 /// Allows editting of user settings, such as generating new users and
 /// passwords, listing of users, editing permissions, etc.
 async fn server_user(args: &Vec<String>) -> Result<(), Box<dyn error::Error>> {
-    todo!("Need to implement this. Generating new users & passwords is top priority")
+    todo!("Need to implement this. Generating new users & passwords is top priority");
+    // let status = get_server_status().await?;
+    // if status.state != ServerState::Running {
+    //     println!("Cannot run command when server is in following state: {:?}", status.state);
+    // }
 }
