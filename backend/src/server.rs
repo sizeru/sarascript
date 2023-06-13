@@ -4,27 +4,30 @@ use std::fs::{File, self};
 use std::io::{prelude::*, BufReader, self, ErrorKind};
 use std::path::Path;
 use std::env::{self, current_dir};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
+use std::str::FromStr;
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::GMTPlus4;
 use compress::zlib;
 use crc::Crc;
+use hyper::body::Body;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls, GenericClient};
 use pwhash::sha512_crypt;
-use crate::{http, config_parser, http::*, get_server_status, server};
+// use crate::{http, config_parser, http::*, get_server_status, server};
+use crate::{get_server_status, CONFIG};
 // The following use statements were made after the cmdutil refactor
 use signal_hook::{consts::*};
 use signal_hook_tokio::Signals;
 use std::{thread, fmt};
 use std::os::unix::net::{UnixStream, UnixListener, UnixDatagram};
 use futures_util::StreamExt;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::Full;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use tokio::net::TcpListener;
 
 
@@ -37,7 +40,6 @@ use serde::{Serialize, Deserialize};
 use const_format::formatcp;
 use std::os::unix::fs::*;
 
-pub const SERVER_FILE: &str = "server_status";
 pub const EXECUTABLE_NAME: &str = "rmc";
 
 static mut status: ServerStatus = ServerStatus { state: ServerState::Unreachable };
@@ -99,7 +101,12 @@ pub async fn run() -> Result<(), Box<dyn error::Error>> {
 
     println!("{}", Server::STARTING_MESSAGE);
     // START THE SERVER
-    let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
+    let addr: SocketAddr; 
+    {
+        let config = CONFIG.read().unwrap();
+        let ipv4_address = &config.ipv4_address;
+        addr = SocketAddr::from_str(ipv4_address).unwrap();
+    }
 
     // Bind to the port and listen for incoming TCP connections
     let listener = TcpListener::bind(addr).await?;
@@ -130,7 +137,27 @@ pub async fn run() -> Result<(), Box<dyn error::Error>> {
 // An async function that consumes a request, does nothing with it and returns a
 // response.
 async fn handle_request(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    Ok(Response::new(Full::new(Bytes::from("Hello World!"))))
+    use hyper::Method;
+    let identifier = (request.method(), request.uri().path());
+    println!("{:#?}", identifier);
+    let response: Result<Response<Bytes>, Response<Bytes>> = match identifier {
+        // (&Method::GET, "/belgrade/documents/search")       => handle_query(&request, &mut db, &request.query, &config.content_root_dir, &config.domain_name),
+        // (&Method::GET, "/belgrade/documents")              => get_document_search(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &config.content_root_dir, &mut db),
+        // (&Method::GET, "/css/styles.css")                  => get_styles(&request.location, &config.content_root_dir),
+        (&Method::GET, "/login")                           => get_login(),
+        // (&Method::GET, "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
+        // (&Method::GET, "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
+        // (&Method::GET, "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
+        // (&Method::POST,"/api/belgrade/documents")          => handle_post(&request, &mut db, &config.content_root_dir),
+        _ => Err(gen_response(StatusCode::NOT_FOUND, "404\nThis URL was not found on this server")) 
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(response) => response,
+    };
+    let (parts, body) = response.into_parts();
+    let response = Response::from_parts(parts, Full::new(body));
+    return Ok(response);
 }
 
 
@@ -138,7 +165,7 @@ async fn handle_request(request: Request<hyper::body::Incoming>) -> Result<Respo
 pub enum Error {
     ServerAlreadyStarted(ServerStatus),
     CouldNotStartServer(String),
-    MissingServerFile,
+    ConfigParseError(String, Box<dyn error::Error>),
     CannotFindExecutable,
     InaccessibleSharedConfig(Box<dyn error::Error>),
     InaccessibleUserConfig(Box<dyn error::Error>),
@@ -158,10 +185,6 @@ impl std::fmt::Display for Error {
                 write!(f, "cannot start a server that is already running. 
                     Server status at time of command: {}", current_status.to_string())
             },
-            Error::MissingServerFile => {
-                write!(f, "Could not find server file `{}` in working directory: {}", SERVER_FILE, env::current_dir().unwrap().display())
-            },
-            
             Error::CannotFindExecutable => {
                 write!(f, "Could not find executable `{}` in working directory: {}", EXECUTABLE_NAME, env::current_dir().unwrap().display())
             },
@@ -195,6 +218,9 @@ impl std::fmt::Display for Error {
             Error::CouldNotStartServer(reason) => {
                 write!(f, "Could not start the server: Reason: {reason}")
             },
+            Error::ConfigParseError(location, source_error) => {
+                write!(f, "Error when parsing config at: {location}. Error: {source_error}")
+            }
         } 
     }
 
@@ -403,216 +429,104 @@ async fn ipc_handler(listener: UnixListener) {
 // EVERYTHING BELOW WAS CREATED BEFORE THE REFACTOR //////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////////////////
 
+// The various types of PDF which are processed
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PDFType {
+    Unknown = 0,
+    BatchWeight = 1,
+    DeliveryTicket = 2,
+}
 
-// // RUST WEBSERVER CONSTANTS
-// const CONFIG_PATH: &str = "/var/www/redimix/backend/data/config.ini";
-// const CR: &[u8] = &[13 as u8];
-// const LF: &[u8] = &[10 as u8];
+// Stores PDF metadata
+#[derive(Debug)]
+struct PDFMetadata {
+    pdf_type: PDFType,
+    // NOTE: Creating a timezone for Atlantic Standard Time (UTC-4). This will prevent having to import chrono-tz package
+    datetime: DateTime<Utc>,
+    customer: String,
+    relative_path: String,
+    doc_number: i32,
+    crc32_checksum: u32,
+}
 
-// // [1] The current request buffer size is 4KB, the pagesize on the computer I'm
-// // running the server on (and most Linux servers as of 2022 Dec). In theory,
-// // memory aligned data speeds up data access by keeping the cache hot, and makes
-// // the maximal use of memory, but I can't help but feel that I'm missing
-// // something. More research and testing needs to be done to find the optimal
-// // request buffer size.
+// Finds the index of the first predicate (the byte to be searched for) in an
+// array of bytes. Searches over a specified range. Returns None if the
+// predicate cannot be found.
+fn u8_index_of(array: &[u8], predicate: u8, start_index: usize, end_index: usize) -> Option<usize> {
+    let index = array[start_index .. end_index]
+        .iter()
+        .position(|&pred| pred == predicate);
+    if index.is_none() {
+        return None;
+    } else {
+        let index = index.unwrap() + start_index;
+        return Some(index)
+    }
+}
 
-// // [2] As of 2022 Dec, receiving multipart/formdata is not supported, and is
-// // very low priority. All data must be sent as a binary stream in the body of a
-// // request.
+// Finds the index of the first predicate (the array of bytes to be searched
+// for) in an array of bytes. Searches over a specified range. Returns None if
+// the predicate cannot be found.
+fn u8_index_of_multi(array: &[u8], predicate: &[u8], start_index: usize, end_index: usize) -> Option<usize> {
+    let index = array[start_index .. end_index]
+        .windows(predicate.len())
+        .position(|pred| pred == predicate);
+    if index.is_none() {
+        return None;
+    } else {
+        let index = index.unwrap() + start_index;
+        return Some(index);
+    }
+}
 
-// #[derive(Debug)]
-// struct Config {
-//     content_root_dir: String,
-//     ip: String,
-//     domain_name: String,
-//     postgres_address: String,
-// }
+// This is a helper function to generate / create a simple response with status
+// and message. The message parameter is generic, and can take any type which
+// implements the Into<Bytes> trait.
+fn gen_response<T: Into<Bytes>>(status_code: StatusCode, message: T) -> Response<Bytes> {
+    let response = Response::new(Into::<Bytes>::into(message));
+    let (mut parts, body) = response.into_parts();
+    parts.status = status_code;
+    return Response::from_parts(parts, body);
+}
 
-// impl Config {
-//     // This is critical path, but only runs once at the very start of the code
-//     // so this code SHOULD panic is something goes wrong
-//     pub fn parse_from(filepath: &str) -> Config {
-//         let values = config_parser::parse(filepath).unwrap();
-        
-//         let domain_name = values.get("domain_name").unwrap();
-//         let content_root_dir = values.get("content_root_dir").unwrap();
-//         let postgres_address = values.get("postgres_address").unwrap();
-//         let ip = values.get("ip").unwrap();
+fn file_open(filepath: &str) -> Result<fs::File, Response<Bytes>> {
+    let file = File::open(filepath);
+    if let Err(error) = file {
+        return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not open file. Reason: {error}")));
+    }
+    let file = file.unwrap();
+    return Ok(file);
+}
+// Reads all bytes from a file. Returns a response if it was unable to.
+// fn read_all_bytes(filepath: &str) -> Result<Vec<u8>, Response<Bytes>> {
 
-//         return Config {
-//             content_root_dir: content_root_dir.to_string(), 
-//             ip: ip.to_string(),
-//             domain_name: domain_name.to_string(),
-//             postgres_address: postgres_address.to_string()
-//         };
+//     let mut contents: Vec<u8> = Vec::new();
+//     if let Err(error) = file.read_to_end(&mut contents) {
+//         return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read file. Reason: {error}")));
 //     }
+//     Bytes::from(&contents[..])
+//     return Ok(contents);
 // }
 
-// // println which only appears in debug mode
-// #[cfg(debug_assertions)]
-// macro_rules! debug_println {
-//     ($($input:expr),*) => {
-//         println!($($input),+);
-//     };
-// }
-// #[cfg(not(debug_assertions))]
-// macro_rules! debug_println {
-//     ($($input:expr),*) => {()}
-// }
-
-// // Macro which returns an error value to a function if it exists
-// macro_rules! unwrap_either { // TODO: This could use a better name
-//     // match something(q,r,t,6,7,8) etc
-//     // compiler extracts function name and arguments. It injects the values in respective varibles.
-//         ($a:ident)=>{
-//            {
-//             match $a {
-//                 Ok(value)=>value,
-//                 Err(err)=>{
-//                     return err;
-//                 }
-//             }
-//             }
-//         };
-//     }
-
-// // The various types of PDF which are processed
-// #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-// enum PDFType {
-//     Unknown = 0,
-//     BatchWeight = 1,
-//     DeliveryTicket = 2,
-// }
-
-
-
-// // TODO: Create a timezone for Atlantic Standard Time (UTC-4). This will prevent having to import chrono-tz package
-// // Stores PDF metadata
-// #[derive(Debug)]
-// struct PDFMetadata {
-//     pdf_type: PDFType,
-//     datetime: DateTime<Utc>, // could easily store this as a different datatype to save space
-//     customer: String,
-//     relative_path: String,
-//     doc_number: i32,
-//     crc32_checksum: u32,
-// }
-
-// // Finds the index of the first predicate (the byte to be searched for) in an
-// // array of bytes. Searches over a specified range. Returns None if the
-// // predicate cannot be found.
-// fn u8_index_of(array: &[u8], predicate: u8, start_index: usize, end_index: usize) -> Option<usize> {
-//     let index = array[start_index .. end_index]
-//         .iter()
-//         .position(|&pred| pred == predicate);
-//     if index.is_none() {
-//         return None;
-//     } else {
-//         let index = index.unwrap() + start_index;
-//         return Some(index)
-//     }
-// }
-
-// // Finds the index of the first predicate (the array of bytes to be searched
-// // for) in an array of bytes. Searches over a specified range. Returns None if
-// // the predicate cannot be found.
-// fn u8_index_of_multi(array: &[u8], predicate: &[u8], start_index: usize, end_index: usize) -> Option<usize> {
-//     let index = array[start_index .. end_index]
-//         .windows(predicate.len())
-//         .position(|pred| pred == predicate);
-//     if index.is_none() {
-//         return None;
-//     } else {
-//         let index = index.unwrap() + start_index;
-//         return Some(index);
-//     }
-// }
-
-// // The main loop for the webserver
-// fn main() {
-//     let config = Config::parse_from(CONFIG_PATH);
-//     debug_println!("Values read from config: {:#?}", config);
-    
-//     // Create singletons which will be used throughout the program
-//     let listener = TcpListener::bind(config.ip).expect("Aborting: Could not connect to server");
-//     let mut db = Client::connect(&config.postgres_address, NoTls).unwrap();       
-//     let mut request_buffer = RequestBuffer::new(); 
-//     // request_buffer be used for every request. pre-allocating on stack.
-
-//     // Listens for a connection
-//     for stream in listener.incoming() {
-//         if let Err(error) = stream {
-//             debug_println!("TcpListener had an error when trying to listen for a TcpStream: {}", &error.to_string());
-//             continue;
-//         }
-//         let mut stream = stream.unwrap();
-
-//         let request = HttpRequest::parse(&mut stream, &mut request_buffer);
-//         if let Err(response) = request {
-//             response.send(&mut stream);
-//             continue;
-//         }
-        
-//         let request = request.unwrap();
-//         debug_println!("Processing complete. Dispatching request");
-//         // special checks for any documents
-//         if request.method.eq("GET") && request.location.starts_with("/belgrade/documents/") && request.location.ne("/belgrade/documents/search") {
-//             let response;
-//             if let Err(redirect_response) = check_authentication(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &mut db) {
-//                 response = redirect_response;
-//             } else {
-//                 response = get_pdf(&request.location, &config.content_root_dir); 
-//             }
-//             response.send(&mut stream);
-//             continue;
-//         }
-
-//         let response: Response = match (request.method.as_str(), request.location.as_str()) {
-//             ("GET", "/belgrade/documents/search")       => handle_query(&request, &mut db, &request.query, &config.content_root_dir, &config.domain_name),
-//             ("GET", "/belgrade/documents")              => get_document_search(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &config.content_root_dir, &mut db),
-//             ("GET", "/css/styles.css")                  => get_styles(&request.location, &config.content_root_dir),
-//             ("GET", "/login")                           => get_login(&config.content_root_dir),
-//             ("GET", "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
-//             ("GET", "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
-//             ("GET", "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
-//             ("POST","/api/belgrade/documents")          => handle_post(&request, &mut db, &config.content_root_dir),
-//             _                                           => NOT_IMPLEMENTED,
-//         };
-
-//         response.send(&mut stream);
-//     }
-    
-//     // Should never reach this...
-//     if let Err(error) = db.close() {
-//         dbg!(error.to_string());
-//     }
-// }
-
-// // Reads all bytes from a file. Returns a response if it was unable to.
-// fn read_all_bytes(filepath: &str) -> Result<Vec<u8>, Response> {
-//     let file = File::open(filepath);
-//     if let Err(error) = file {
-//         return Err(INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not open the requested file: {}", error.to_string())));
-//     }
-//     let mut file = file.unwrap();
-//     let mut bytes = Vec::new();
-//     let bytes_read = file.read_to_end(&mut bytes);
-//     if let Err(error) = bytes_read {
-//         return Err(INTERNAL_SERVER_ERROR.clone_with_message(format!("Could not read from the requested file: {}", error.to_string()))); 
-//     }
-//     return Ok(bytes);
-// }
-
-// // Return the login page. Save the referer in the URL 
-// fn get_login(content_root_dir: &str) -> Response {
-//     let login = read_all_bytes(&format!("{}{}", content_root_dir, "/login.html"));
-//     let login = unwrap_either!(login);  
-    
-//     let mut response = OK;
-//     response.add_header("content-type", HTML.to_string());
-//     response.add_message(login);
-//     return response;
-// }
+// Return the static login webpage. ASSUMES that login.html is well-formced.
+// WARNING: This reads the entire login.html file into a vector. It is possible
+// - if this file were maliciously large - for the file to take up all memory
+// and swap space on the computer. HOWEVER, if one could modify login.html,
+// then there are much bigger problems afoot.
+fn get_login() -> Result<Response<Bytes>, Response<Bytes>> {
+    let config = &CONFIG;
+    let config_reader = CONFIG.read().unwrap();
+    let root_dir = &config_reader.web_content_root_dir;
+    let mut file = file_open(&format!("{root_dir}/login.html"))?;
+    let mut contents: Vec<u8> = Vec::new();
+    if let Err(error) = file.read_to_end(&mut contents) {
+        return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read file. Reason: {error}")));
+    }
+    let response = Response::new(Bytes::from(contents));
+    // let (mut parts, body) = response.into_parts();
+    // Need to set the location appropriately
+    return Ok(response);
+}
 
 // // A user has just submitted a form with his credentials. Perform the
 // // cryptographic hashing and match it to data stored in the server. If the user

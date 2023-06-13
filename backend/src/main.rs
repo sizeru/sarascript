@@ -1,16 +1,14 @@
-use std::{env, process, fs, error, io, default};
+use std::{env, process, fs, error, io, sync::RwLock};
+use std::os::unix::fs::DirBuilderExt;
 use log::{info, warn}; // TODO: Add appropriate trace, debug, error logs
 use simplelog;
-use chrono;
 use serde::{Serialize, Deserialize};
-use std::os::unix::fs::DirBuilderExt;
-use server::{ServerState, ServerStatus, Server, Error};
-use crate::server::{IPCCommand, IPCResponse};
 mod server;
-mod http;
-mod config_parser;
+use server::{ServerState, ServerStatus, Server, Error, IPCCommand, IPCResponse};
 
 const LOG_FILE: &str = "/var/log/rmc/rmc.log";
+// The type is Box<Config> rather than Config so that it is trivial to replace the Config when needed
+static CONFIG: RwLock<Config> = RwLock::new(Config::EMPTY);
 
 /// This comment is outdated. Right now there is an install script
 /// and chances are the server should be run as a daemon using
@@ -34,11 +32,21 @@ async fn main() {
         .create(true)
         .open(LOG_FILE)
         .expect("Could not create log file");
+    // TODO: Make the debug logger appear in the println only in debug builds
     simplelog::WriteLogger::init(
         simplelog::LevelFilter::Info, 
         simplelog::Config::default(),
         log
     ).expect("Could not initialize logger");
+    {
+        let config = &CONFIG;
+        let mut config_writer = config.write().unwrap();
+        config_writer.init_default();
+    }
+    if let Err(error) = Config::load() {
+        println!("{error}");
+        process::exit(1);
+    }
     
     // Dispatch the correct function based off of the command
     let cmdline_args: Vec<String> = env::args().collect();
@@ -48,7 +56,7 @@ async fn main() {
             "run" => server::run().await,
             "stop" => server_stop(&cmdline_args).await,
             "status" => server_status().await,
-            "backup" => server_backup(&cmdline_args).await,
+            // "backup" => server_backup(&cmdline_args).await,
             "user" => server_user(&cmdline_args).await,
             "create" => server_create().await,
             "help" => help(),
@@ -79,124 +87,160 @@ enum DataCategories {
     Logs,
 }
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    local_server_user: Option<String>,
-    backup_options: Option<BackupOptions>,
+#[derive(Deserialize)]
+struct ParsedConfig {
+    // backup_options: Option<BackupOptions>,
+    web_content_root_dir: Option<String>,
+    ipv4_address: Option<String>,
+    postgres_connection_uri: Option<String>,
 }
 
-impl default::Default for Config {
-    fn default() -> Self {
-        Config {
-            backup_options: Some(BackupOptions::default()),
-            local_server_user: Some("rmc-local".to_string()),
+
+struct Config {
+    web_content_root_dir: String,
+    ipv4_address: String,
+    postgres_connection_uri: String,
+}
+
+
+impl Config {
+    const EMPTY: Config = Config {
+        web_content_root_dir: String::new(), //"/var/www/rmc".to_owned(),
+        ipv4_address: String::new(), // "127.0.0.1:7878".to_owned(),
+        postgres_connection_uri: String::new(), // "postgresql://localhost:5432/rmc".to_owned(),
+    };
+
+    fn init_default(&mut self) {
+        self.web_content_root_dir = String::from("/var/www/rmc");
+        self.ipv4_address = String::from("127.0.0.1:7878");
+        self.postgres_connection_uri = String::from("postgresql://localhost:5432/rmc");
+    }
+
+    fn update(&mut self, new_config: &ParsedConfig) {
+        if let Some(web_content_root_dir) = &new_config.web_content_root_dir {
+            self.web_content_root_dir = web_content_root_dir.clone();
+        }    
+        if let Some(ipv4_address) = &new_config.ipv4_address {
+            self.ipv4_address = ipv4_address.clone();
         }
+        if let Some(postgres_connection_uri) = &new_config.postgres_connection_uri {
+            self.postgres_connection_uri = postgres_connection_uri.clone();
+        }
+    }
+
+    // Loads config settings from the filesystem into the CONFIG singleton.
+    pub fn load() -> Result<(), Box<dyn error::Error>> {
+        let shared_config = ParsedConfig::shared()?;
+        let config = &CONFIG;
+        let mut config_writer = config.write().unwrap();
+        config_writer.update(&shared_config);
+        return Ok(());
     }
 }
 
-impl Config {
+
+impl ParsedConfig {
     const USER_PATH: &str = ".config/rmc";
     const SHARED_PATH: &str = "/etc/xdg/rmc";
     const FILENAME: &str = "rmc.conf";
 
-    fn user() -> Result<Config, Box<dyn error::Error>> {
-        // TODO: Should create this folder if it does not exist
-        let home = env::var("HOME")?;
-        let user_config_file = format!("{}/{}/{}", home, Config::USER_PATH, Config::FILENAME);
-        let user_config = fs::File::open(user_config_file)?;
-        let user_config_reader = io::BufReader::new(user_config);
-        let config: Config = serde_json::from_reader(user_config_reader)?; 
-        return Ok(config);
-    }
+    // User config is not currently used
+    // fn user() -> Result<Config, Box<dyn error::Error>> {
+    //     // TODO: Should create this folder if it does not exist
+    //     let home = env::var("HOME")?;
+    //     let user_config_file = format!("{}/{}/{}", home, Config::USER_PATH, Config::FILENAME);
+    //     let user_config = fs::File::open(user_config_file)?;
+    //     let user_config_reader = io::BufReader::new(user_config);
+    //     let config: Config = serde_json::from_reader(user_config_reader)?; 
+    //     return Ok(config);
+    // }
 
-    fn shared() -> Result<Config, Box<dyn error::Error>> {
+    fn shared() -> Result<ParsedConfig, Box<dyn error::Error>> {
         // TODO: Should create this folder if it does not exist
-        let shared_config_file = format!("{}/{}", Config::SHARED_PATH, Config::FILENAME);
+        let shared_config_file = format!("{}/{}", ParsedConfig::SHARED_PATH, ParsedConfig::FILENAME);
         let shared_config = fs::File::open(shared_config_file)?;
         let shared_config_reader = io::BufReader::new(shared_config);
-        let config: Config = serde_json::from_reader(shared_config_reader)?; 
-        return Ok(config);
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct BackupOptions {
-    output_file: Option<String>,
-    data: Option<DataCategories>,
-    from_date: Option<String>, // TODO: Date should be a struct
-    to_date: Option<String>,
-}
-
-impl default::Default for BackupOptions {
-    fn default() -> Self {
-        return BackupOptions {
-            output_file: Some(format!("rmc_server_backup-{}.bkp", chrono::offset::Local::now().format("%Y_%b_%d"))),
-            data: Some(DataCategories::All),
-            from_date: Some(String::new()),
-            to_date: Some(String::new()),
-        }    
-    }
-}
-
-impl BackupOptions {
-    /// Retrieve and set options for this backup based on Config options and command line
-    /// options. Program will not fail if a config cannot be accessed. Program
-    /// will fail if the cmdline is malformed in any way.
-    pub fn retrieve(cmdline_args: Option<&Vec<String>>) -> Result<BackupOptions, Box<dyn error::Error>> {
-        let mut backup_options = BackupOptions::default(); 
-        let shared_config = Config::shared();
-        match shared_config {
-            Ok(config) => backup_options.update(&config.backup_options),
-            Err(error) => warn!("Could not read from the shared config. Error: {}", error.to_string()),
-        }
-
-        let user_config = Config::user();
-        match user_config {
-            Ok(config) => backup_options.update(&config.backup_options),
-            Err(error) => warn!("Could not read from the user config. Error: {}", error.to_string()),
-        }
-
-        if let Some(args) = cmdline_args {
-            for i in 2..args.len() {
-                let arg = &args[i]; 
-                let split: Vec<&str> = arg.split('=').collect();
-                if split.len() != 2 {
-                    return Err(Box::new(Error::MalformedCmdline(args[i].clone())));
-                }
-                let key = *split.get(0).unwrap();
-                let value = *split.get(1).unwrap();
-                match key {
-                    "--output-file" => {
-                        backup_options.output_file = Some(value.to_owned()); 
-                    },
-                    "--data" => todo!(),
-                    "--from-date" => todo!(),
-                    "--to-date" => todo!(),
-                    _ => return Err(Box::new(Error::MalformedCmdline(args[i].clone()))),
-                }
-            }
-        }
-        return Ok(backup_options);
-    }
-
-    /// Update the backup options with any options from a new BackupOptions struct
-    fn update(&mut self, backup_options: &Option<BackupOptions>) {
-        if let Some(backup_options) = backup_options {
-            if let Some (data) = &backup_options.data {
-                self.data = Some(data.clone());
-            }
-            if let Some(from_date) = &backup_options.from_date {
-                self.from_date = Some(from_date.clone());
-            }
-            if let Some(to_date) = &backup_options.to_date {
-                self.to_date = Some(to_date.clone());
-            }
-            if let Some(output_file) = &backup_options.output_file {
-                self.output_file = Some(output_file.clone());
+        let parsed_config: Result<ParsedConfig, serde_json::Error> = serde_json::from_reader(shared_config_reader); 
+        match parsed_config {
+            Ok(parsed_config) => {
+                return Ok(parsed_config);
+            },
+            Err(error) => {
+                return Err(Error::ConfigParseError(
+                    format!("{}/{}", ParsedConfig::SHARED_PATH, ParsedConfig::FILENAME), Box::new(error)
+                ).into());
             }
         }
     }
 }
+
+// #[derive(Serialize, Deserialize)]
+// struct BackupOptions {
+//     output_file: Option<String>,
+//     data: Option<DataCategories>,
+//     from_date: Option<String>, // TODO: Date should be a struct
+//     to_date: Option<String>,
+// }
+
+// impl default::Default for BackupOptions {
+//     fn default() -> Self {
+//         return BackupOptions {
+//             output_file: Some(format!("rmc_server_backup-{}.bkp", chrono::offset::Local::now().format("%Y_%b_%d"))),
+//             data: Some(DataCategories::All),
+//             from_date: Some(String::new()),
+//             to_date: Some(String::new()),
+//         }    
+//     }
+// }
+
+// impl BackupOptions {
+//     /// Retrieve and set options for this backup based on Config options and command line
+//     /// options. Program will not fail if a config cannot be accessed. Program
+//     /// will fail if the cmdline is malformed in any way.
+//     pub fn retrieve(cmdline_args: Option<&Vec<String>>) -> Result<BackupOptions, Box<dyn error::Error>> {
+//         let config = CONFIG.read().unwrap();
+//         let backup_options = config.backup_options.unwrap();
+//         if let Some(args) = cmdline_args {
+//             for i in 2..args.len() {
+//                 let arg = &args[i]; 
+//                 let split: Vec<&str> = arg.split('=').collect();
+//                 if split.len() != 2 {
+//                     return Err(Box::new(Error::MalformedCmdline(args[i].clone())));
+//                 }
+//                 let key = *split.get(0).unwrap();
+//                 let value = *split.get(1).unwrap();
+//                 match key {
+//                     "--output-file" => {
+//                         backup_options.output_file = Some(value.to_owned()); 
+//                     },
+//                     "--data" => todo!(),
+//                     "--from-date" => todo!(),
+//                     "--to-date" => todo!(),
+//                     _ => return Err(Box::new(Error::MalformedCmdline(args[i].clone()))),
+//                 }
+//             }
+//         }
+//         return Ok(backup_options);
+//     }
+
+//     /// Update the backup options with any options from a new BackupOptions struct
+//     fn update(&mut self, backup_options: &Option<BackupOptions>) {
+//         if let Some(backup_options) = backup_options {
+//             if let Some (data) = &backup_options.data {
+//                 self.data = Some(data.clone());
+//             }
+//             if let Some(from_date) = &backup_options.from_date {
+//                 self.from_date = Some(from_date.clone());
+//             }
+//             if let Some(to_date) = &backup_options.to_date {
+//                 self.to_date = Some(to_date.clone());
+//             }
+//             if let Some(output_file) = &backup_options.output_file {
+//                 self.output_file = Some(output_file.clone());
+//             }
+//         }
+//     }
+// }
 
 
 // Create a new daemon process which will run the server.
@@ -327,7 +371,7 @@ async fn server_create() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
     
-/// Allows editting of user settings, such as generating new users and
+/// Allows editing of user settings, such as generating new users and
 /// passwords, listing of users, editing permissions, etc.
 async fn server_user(args: &Vec<String>) -> Result<(), Box<dyn error::Error>> {
     todo!("Need to implement this. Generating new users & passwords is top priority");
