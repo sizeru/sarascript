@@ -299,10 +299,8 @@ async fn get_server_status() -> Result<ServerStatus, Box<dyn error::Error>> {
 
 /// Safely stop the server after the last process is complete.
 async fn server_stop(cmdline_args: &Vec<String>) -> Result<(), Box<dyn error::Error>> {
-    info!("Sending signal to stop server");
     let pid_file = Server::pid_file()?;
     let contents = fs::read_to_string(pid_file)?;
-    println!("pid: {}", contents);
     let pid = contents.parse::<usize>()?;
 
     if let Some(flag) = cmdline_args.get(2) {
@@ -316,16 +314,16 @@ async fn server_stop(cmdline_args: &Vec<String>) -> Result<(), Box<dyn error::Er
                 Ok(output) => {
                     let runtime_dir = Server::runtime_dir().unwrap();
                     fs::remove_dir_all(runtime_dir).unwrap();
-                    println!("Forced closed and manually cleaned up runtime files.\n{:?}", output);
+                    println!("Force closing PID {pid} and manually cleaning up runtime files.");
                     return Ok(())
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        return Err(Box::new(Error::UnknownUsage(cmdline_args.iter().map(|x| format!("{} ", x)).collect::<String>())))
+        return Err(Box::new(Error::UnknownUsage(cmdline_args.iter().map(|x| format!("{x} ")).collect::<String>())))
     } 
     
-    println!("Sending");
+    println!("Sending signal to stop server at PID: {pid}");
     process::Command::new("kill")
         .arg("-s")
         .arg("SIGINT")

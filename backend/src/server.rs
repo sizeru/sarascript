@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::fs::{File, self};
 use std::io::{prelude::*, BufReader, self, ErrorKind};
 use std::path::Path;
+use std::rc::Rc;
 use std::env::{self, current_dir};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::str::FromStr;
@@ -144,13 +145,16 @@ async fn handle_request(request: Request<hyper::body::Incoming>) -> Result<Respo
         // (&Method::GET, "/belgrade/documents/search")       => handle_query(&request, &mut db, &request.query, &config.content_root_dir, &config.domain_name),
         // (&Method::GET, "/belgrade/documents")              => get_document_search(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &config.content_root_dir, &mut db),
         // (&Method::GET, "/css/styles.css")                  => get_styles(&request.location, &config.content_root_dir),
-        (&Method::GET, "/login")                           => get_login(),
+        (&Method::GET, "/login")                              => get_login(),
         // (&Method::GET, "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
         // (&Method::GET, "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
         // (&Method::GET, "/api/belgrade/documents/exists")   => document_exists(&request.query, &mut db),
         // (&Method::POST,"/api/belgrade/documents")          => handle_post(&request, &mut db, &config.content_root_dir),
+        #[cfg(feature = "full-server")]
+        (&Method::GET, _) => fetch_content(&request),
         _ => Err(gen_response(StatusCode::NOT_FOUND, "404\nThis URL was not found on this server")) 
     };
+    let vec = Vec::<u8>::new();
     let response = match response {
         Ok(response) => response,
         Err(response) => response,
@@ -490,9 +494,9 @@ fn gen_response<T: Into<Bytes>>(status_code: StatusCode, message: T) -> Response
 }
 
 fn file_open(filepath: &str) -> Result<fs::File, Response<Bytes>> {
-    let file = File::open(filepath);
-    if let Err(error) = file {
-        return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not open file. Reason: {error}")));
+    let file: Result<File, io::Error> = File::open(filepath);
+    if let Err(_) = file {
+        return Err(gen_response(StatusCode::NOT_FOUND, format!("This file could not be found")));
     }
     let file = file.unwrap();
     return Ok(file);
@@ -528,6 +532,40 @@ fn get_login() -> Result<Response<Bytes>, Response<Bytes>> {
     return Ok(response);
 }
 
+fn fetch_content<T>(request: &Request<T>) -> Result<Response<Bytes>, Response<Bytes>>
+{
+    let root;
+    {
+        let config = CONFIG.read().unwrap();
+        root = config.web_content_root_dir.clone();
+    }
+    let uri = request.uri();
+    let content_path;
+    if uri.path().eq("/") {
+        content_path = format!("{root}/index.html");
+    } else if uri.path().contains(".") {
+        content_path = format!("{root}/{uri}") 
+    } else {
+        if uri.path().ends_with("/") {
+            content_path = format!("{root}/{uri}index.html") 
+        } else {
+            content_path = format!("{root}/{uri}/index.html")
+        }
+    }
+    let mut file = file_open(&content_path)?;
+    let mut growing_buffer = Vec::new();
+    if let Err(_) = file.read_to_end(&mut growing_buffer) {
+        return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("COul")))
+    }
+    let contents = Bytes::from(growing_buffer);
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .body(contents);
+    match response {
+        Ok(response) => return Ok(response),
+        Err(error) => return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not generate response. Reason: {error}")))
+    }
+}
 // // A user has just submitted a form with his credentials. Perform the
 // // cryptographic hashing and match it to data stored in the server. If the user
 // // is who they say they are, give them a cookie and return them to the page they
