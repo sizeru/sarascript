@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs::{File, self};
 use std::io::{prelude::*, BufReader, self, ErrorKind};
+use std::ops::BitOr;
 use std::path::Path;
 use std::rc::Rc;
 use std::env::{self, current_dir};
 use std::net::{SocketAddr, SocketAddrV4};
+use std::str;
 use std::str::FromStr;
-use base64::{Engine as _, engine::general_purpose};
 use chrono::{Utc, TimeZone, DateTime};
 use chrono_tz::Etc::GMTPlus4;
 use compress::zlib;
@@ -16,6 +17,7 @@ use hyper::body::Body;
 use num_digitize::FromDigits;
 use postgres::{Client, NoTls, GenericClient};
 use pwhash::sha512_crypt;
+use signal_hook::iterator::exfiltrator::raw;
 // use crate::{http, config_parser, http::*, get_server_status, server};
 use crate::{get_server_status, CONFIG};
 // The following use statements were made after the cmdutil refactor
@@ -134,17 +136,48 @@ pub async fn run() -> Result<(), Box<dyn error::Error>> {
     }
 }
 
+#[repr(u64)]
+enum AuthFlags {
+    ViewBelgradeDocuments = 0x1,
+    EditUsers = 0x2,
+}
+
+impl From<AuthFlags> for u64 {
+    fn from(value: AuthFlags) -> Self {
+        return value as u64;
+    }
+}
+
+impl BitOr for AuthFlags {
+    type Output = u64;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        return self as u64 | rhs as u64;
+    }
+}
 
 // An async function that consumes a request, does nothing with it and returns a
 // response.
 async fn handle_request(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     use hyper::Method;
+    let uri = request.uri();
+    let authorization;
+    if uri.path().starts_with("/belgrade/documents") {
+        let flags = AuthFlags::EditUsers | AuthFlags::EditUsers;
+        authorization = check_authorization(&request, flags)
+    } else {
+        authorization = Ok(());
+    }
+    if let Err(_) = authorization {
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Full::new(Bytes::from("Not authorized")))
+            .unwrap()); 
+    }
     let identifier = (request.method(), request.uri().path());
     println!("{:#?}", identifier);
     let response: Result<Response<Bytes>, Response<Bytes>> = match identifier {
         // (&Method::GET, "/belgrade/documents/search")       => handle_query(&request, &mut db, &request.query, &config.content_root_dir, &config.domain_name),
         // (&Method::GET, "/belgrade/documents")              => get_document_search(&request.location, &request.query, request.headers.get("Cookie"), &config.domain_name, &config.content_root_dir, &mut db),
-        // (&Method::GET, "/css/styles.css")                  => get_styles(&request.location, &config.content_root_dir),
         (&Method::GET, "/login")                              => get_login(),
         // (&Method::GET, "/api/user/login")                  => check_login(&request.query, &request.headers.get("Referer"), &config.domain_name, &mut db),
         // (&Method::GET, "/api/user/change-password")        => todo!("Need to do this"), //change_password(&request.query, &request.headers, &mut db),
@@ -162,6 +195,10 @@ async fn handle_request(request: Request<hyper::body::Incoming>) -> Result<Respo
     let (parts, body) = response.into_parts();
     let response = Response::from_parts(parts, Full::new(body));
     return Ok(response);
+}
+
+fn check_authorization<T>(request: &Request<T>, authorization_flags: u64) -> Result<(),()> {
+    return Ok(()); 
 }
 
 
@@ -496,7 +533,15 @@ fn gen_response<T: Into<Bytes>>(status_code: StatusCode, message: T) -> Response
 fn file_open(filepath: &str) -> Result<fs::File, Response<Bytes>> {
     let file: Result<File, io::Error> = File::open(filepath);
     if let Err(_) = file {
-        return Err(gen_response(StatusCode::NOT_FOUND, format!("This file could not be found")));
+        let filename = filepath.split('/').last();
+        if let Some(filename) = filename {
+            return Err(gen_response(StatusCode::NOT_FOUND, format!("{filename} could not be found")));
+        } else {
+            return Err(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Bytes::from(format!("{filepath} could not be found")))
+                .unwrap());
+        }
     }
     let file = file.unwrap();
     return Ok(file);
@@ -532,7 +577,7 @@ fn get_login() -> Result<Response<Bytes>, Response<Bytes>> {
     return Ok(response);
 }
 
-fn fetch_content<T>(request: &Request<T>) -> Result<Response<Bytes>, Response<Bytes>>
+fn fetch_content<'a, T>(request: &Request<T>) -> Result<Response<Bytes>, Response<Bytes>>
 {
     let root;
     {
@@ -543,29 +588,122 @@ fn fetch_content<T>(request: &Request<T>) -> Result<Response<Bytes>, Response<By
     let content_path;
     if uri.path().eq("/") {
         content_path = format!("{root}/index.html");
-    } else if uri.path().contains(".") {
-        content_path = format!("{root}/{uri}") 
+    } else if uri.path().contains(".") { // FIXME: This is not a foolproof check
+        content_path = format!("{root}{uri}") 
     } else {
         if uri.path().ends_with("/") {
-            content_path = format!("{root}/{uri}index.html") 
+            content_path = format!("{root}{uri}index.html") 
         } else {
-            content_path = format!("{root}/{uri}/index.html")
+            content_path = format!("{root}{uri}/index.html")
         }
     }
+    println!("Path: {content_path}");
     let mut file = file_open(&content_path)?;
     let mut growing_buffer = Vec::new();
     if let Err(_) = file.read_to_end(&mut growing_buffer) {
         return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("COul")))
     }
-    let contents = Bytes::from(growing_buffer);
+
+    let include_files = get_html_includes(&growing_buffer[..])?;
+    let generated_html = insert_html_includes(&growing_buffer[..], &include_files[..])?;
+       
     let response = Response::builder()
         .status(StatusCode::OK)
-        .body(contents);
+        .body(Bytes::from(Box::from(generated_html.as_ref())));
     match response {
         Ok(response) => return Ok(response),
         Err(error) => return Err(gen_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not generate response. Reason: {error}")))
     }
 }
+
+#[derive(Debug)]
+struct HtmlIncludeComment<'a> {
+    start_index: usize,
+    length: usize,
+    include_file: &'a str,
+}
+
+/// Returns all filenames which are to be included in this struct. The returned
+/// vec is guaranteed to be sorted from largest index to smallest index (so
+/// that when iterating through names, you will corrupt previous indices by
+/// inserting html
+fn get_html_includes(buffer: &[u8]) -> Result<Rc<[HtmlIncludeComment]>, Response<Bytes>> {
+    let include_prefix = "<!--#include \"".as_bytes().to_vec();
+
+    let include_indices: Vec<usize> = buffer
+        .windows(include_prefix.len())
+        .enumerate()
+        .filter(|&(_index, string)| string.eq(&include_prefix[..]))
+        .map(|(index, _string)| index + include_prefix.len())
+        .collect();
+
+    let end_delimiter = '\"' as u8;
+    let mut lengths: Vec<usize> = Vec::new();
+    for &index in &include_indices {
+        let end_index = buffer[index..]
+            .iter()
+            .position(|&char| char.eq(&end_delimiter));
+        if let Some(end_index) = end_index {
+            lengths.push(end_index);
+        }
+    }
+    if include_indices.len() != lengths.len() {
+        return Err(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Bytes::from("Somebody didn't format the HTML include comment correctly"))
+            .unwrap());
+    }
+    let mut include_comments: Vec<HtmlIncludeComment> = Vec::new();
+    for i in 0..include_indices.len() {
+        let slice = &buffer[include_indices[i]..include_indices[i]+lengths[i]]; 
+        match std::str::from_utf8(slice) {
+            Ok(filepath) => {
+                // NOTE: The adding and subtracting done here is so that the
+                // length and size include the HTML comment itself, rather than
+                // just the filename
+                let html_include_comment = HtmlIncludeComment {
+                    start_index: include_indices[i] - include_prefix.len(),
+                    length: lengths[i] + include_prefix.len() + 4,
+                    include_file: filepath,
+                };
+                include_comments.push(html_include_comment);
+            }
+            Err(_) => {
+                return Err(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Bytes::from("Invalid utf-8 in HTML include comment"))
+                    .unwrap());
+            }
+        }
+    }
+    include_comments.sort_by(|a, b| a.start_index.cmp(&b.start_index).reverse());
+    return Ok(include_comments.into());
+}
+
+fn insert_html_includes(raw_html: &[u8], include_files: &[HtmlIncludeComment]) -> Result<Rc<[u8]>, Response<Bytes>> {
+    let mut html: Vec<u8> = Vec::with_capacity(raw_html.len()); 
+    html.resize(raw_html.len(), 0);
+    html.copy_from_slice(raw_html);
+    for include_file in include_files {
+        let mut external_file: File;
+        {
+            let config = CONFIG.read().unwrap();
+            let root = &config.web_content_root_dir;
+            external_file = file_open(&format!("{root}{}", include_file.include_file))?;
+        };
+        let mut external_content = Vec::new();
+        if let Err(_) = external_file.read_to_end(&mut external_content) {
+            return Err(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Bytes::from("Error when reading contents of external file."))
+                .unwrap());
+        }
+        let range = include_file.start_index .. include_file.start_index+include_file.length;
+        html.splice(range, external_content);
+    }
+    return Ok(html.into())
+}
+
 // // A user has just submitted a form with his credentials. Perform the
 // // cryptographic hashing and match it to data stored in the server. If the user
 // // is who they say they are, give them a cookie and return them to the page they
