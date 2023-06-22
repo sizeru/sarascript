@@ -34,7 +34,7 @@
 	}
 }
 
-nav ul {
+nav {
 	background-color: var(--navbar-background-color);
 	position: fixed;
 	top: 0;
@@ -46,10 +46,10 @@ nav ul {
 	margin: 0;
 	padding: 0;
 	border-bottom: var(--navbar-border); 
-	overflow: hidden;
+	/* overflow: hidden; */
 }
 
-nav li {
+nav a {
 	float: right;
 	display: flex;
 	color: var(--navbar-link-color);
@@ -63,18 +63,17 @@ nav li {
 	border-left: var(--navbar-border); 
 }
 
-nav .home {
+.navbar-home {
 	float: left;
 	padding: 0 2vw;
 }
 
-
-nav li:hover {
+nav a:hover {
 	background-color: var(--navbar-highlight-color);
 	color: var(--navbar-highlight-text-color)
 }
 
-nav .home:hover {
+.navbar-home:hover {
 	border-right: var(--navbar-border);
 }
 
