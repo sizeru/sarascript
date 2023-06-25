@@ -1,6 +1,3 @@
 /.vscode
-backend/target
-backend/data/config.ini
-backend/tests
-belgrade/documents/*
-belgrade/reports/*
+target
+tests
