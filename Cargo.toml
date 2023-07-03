@@ -1,37 +1,7 @@
 [package]
-name = "rmc"
-version = "0.2.0"
+name = "htmlprep"
+version = "0.1.0"
 edition = "2021"
 
-[features]
-full-server = []
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-log = "0.4.17"
-simplelog = "0.12.0"
-tokio = { version = "1.28.1", features = ["full"] }
-serde = { version = "1.0.163", features = ["derive"] }
-serde_json = "1.0.96"
-chrono = { version = "0.4.23", features = ["clock"] }
-signal-hook = "0.3.15"
-signal-hook-tokio = {version = "0.3.1", features = ["futures-v0_3"] }
-futures-util = "0.3.28"
-const_format = "0.2.31"
-hyper = { version = "1.0.0-rc.3", features = ["full"] }
-http-body-util = "0.1.0-rc.2" 
-bytes = "1"
-# ---------- PLACEHOLDER ---------- most recent version of tokio is 1.28.1 but this default 
-base64 = "0.21.0"
-chrono-tz = "0.8.1"
-compress = "0.2.1"
-crc = "3.0.0"
-num-digitize = "0.4.2"
-postgres = { versio="0.19.4", features=["with-chrono-0_4"] }
-pwhash = "1.0.0"
-rand = "0.8.5"
-urlencoding = "2.1.2"
-# base64 = "0.13.0"
-# lazy_static = "1.4.0"
-# regex = "1.5.4"
+regex = "1.8.4"
