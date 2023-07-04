@@ -3,7 +3,7 @@ name = "htmlprep"
 version = "0.0.3"
 description = "IN-ALPHA: An HTML Pre-Processor for creating static HTML files"
 license = "MIT OR Apache-2.0"
-exclude = ["/testdata", "/tests"]
+include = ["/src"]
 rust-version = "1.70"
 
 edition = "2021"
