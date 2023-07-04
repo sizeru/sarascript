@@ -1,4 +1,4 @@
-use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock}; 
+use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap}; 
 use regex::bytes::{Regex, RegexBuilder, Captures};
 
 static RE: OnceLock<Regex> = OnceLock::new();
@@ -19,7 +19,7 @@ enum ErrorType {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Error type: {:?} at file: {}, line: {} ", self.kind, file!(), line!())
+        write!(f, "Error type: {:?} caused by: {:?} ", self.kind, self.source)
     }
 }
 
@@ -37,16 +37,108 @@ impl From<Utf8Error> for Error {
     }
 }
 
+
+struct CompileOptions<'a> {
+    process_extensions: HashMap<String, String>,
+    skip_extensions: Vec<String>,
+    source: &'a Path,
+    dest: &'a Path,
+    root: &'a Path,
+}
+
+impl Default for CompileOptions<'_> {
+    fn default() -> Self {
+        Self {
+            process_extensions: HashMap::from([
+                ("html".to_owned(), "html".to_owned()),
+                ("htmlraw".to_owned(), "html".to_owned()),
+            ]),
+            skip_extensions: vec![
+                String::from("htmlsnippet"),
+                String::from("")
+            ],
+            source: Path::new("."),
+            dest: Path::new("processed_html"),
+            root: Path::new("/"),
+        }
+    }
+}
+
+impl CompileOptions<'_> {
+    pub fn compile(&self) -> Result<(), Error> 
+    {
+        // Do not allow dest dir to overwrite an existing file
+        match fs::metadata(self.dest) {
+            Err(error) => {
+                if error.kind().eq(&io::ErrorKind::NotFound) {
+                    fs::create_dir_all(self.dest)?;
+                }
+            },
+            Ok(dest_metadata) => {
+                if !dest_metadata.is_dir() {
+                    return Err(Error{kind: ErrorType::DirExists, source: None});
+                }
+            }
+        }
+        // Ensure that the root dir is a dir and actually exists
+        {
+            let root_metadata = fs::metadata(self.root)?;
+            if !root_metadata.is_dir() {
+                return Err(Error{kind: ErrorType::DirExists, source: None});
+            }
+        }
+        // All checkable options are valid. Begin processing.
+        let source_metadata = fs::metadata(self.source)?;
+        if source_metadata.is_dir() {
+            self.compile_dir(self.source, self.dest)?;
+        } else if source_metadata.is_file() {
+            let processed = process_file(self.source, self.root)?;
+            fs::write(
+                self.dest.join(self.source.file_name().unwrap()),
+                &processed
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Recursively tries to process every file in a directory
+    fn compile_dir(&self, source: &Path, dest: &Path) -> Result<(), Error> {
+        let dir_entries = source.read_dir()?;
+        for entry in dir_entries {
+            let file = entry?;
+            let file_type = file.file_type()?;
+            let file_path = file.path();
+            let file_extension = match file_path.extension() {
+                Some(extension) => extension.to_str().unwrap().to_owned(),
+                None => String::from(""),
+            };
+            if self.skip_extensions.contains(&file_extension) {
+                continue;
+            }
+            let dest = dest.join(&file.file_name());
+            if file_type.is_dir() {
+                self.compile_dir(&file_path, &dest)?; 
+            } else if file_type.is_file() {
+                match self.process_extensions.get(&file_extension) {
+                    None => {
+                        fs::copy(&file_path, &dest)?;
+                    },
+                    Some(extension) => {
+                        let processed = process_file(&file.path(), self.root)?;
+                        fs::write(&dest.with_extension(extension), &processed)?;
+                    },
+                }
+            } else {
+                return Err(Error{ kind: ErrorType::SimLinkFound, source: None });
+            }
+        }
+        Ok(())
+    } 
+
+}
+
 // TODO ASAP:
-// - Right now we just blindly copy over files, but it would be massively
-// beneficial to control exactly what files are copied, processed and left
-// behind. For example:
-//      - Process: .html .htmlraw
-//      - Ignore: .htmlsnippet 
-//      - and copy all others
-// - Move tests to its own dir
 // - Better tests
-// - Option to keep everything in memory
 
 // TODO would be nice:
 // - It would be nice if there was a cmdline util
@@ -59,7 +151,7 @@ impl From<Utf8Error> for Error {
 
 /// Processes a single file and returns a structure containing the entire file
 /// in memory
-pub fn process_file(file: &Path, webroot: &str) -> Result<Vec<u8>, Error> {
+pub fn process_file(file: &Path, webroot: &Path) -> Result<Vec<u8>, Error> {
     let re = RE.get_or_init(|| RegexBuilder::new(
         r#"<!--.*?#include\s+"([^"]+)".*?-->"#
     )
@@ -102,47 +194,12 @@ pub fn process_file(file: &Path, webroot: &str) -> Result<Vec<u8>, Error> {
 /// ```
 pub fn compile(source: &str, dest: &str, webroot: &str) -> Result<(), Error> 
 {
-    // Do not let process overwrite anything
-    let source = Path::new(source);
-    let dest = Path::new(dest);
-    match dest.exists() {
-        false => {
-            fs::create_dir_all(dest)?;
-        }
-        true => {
-            if !dest.is_dir() {
-                return Err(Error{kind: ErrorType::DirExists, source: None});
-            }
-        }
-    };
-    if source.is_dir() {
-        compile_dir(source, dest, webroot)?;
-    } else if source.is_file() {
-        let processed_html = process_file(source, webroot)?;
-        let filename = dest.join(source.file_name().unwrap()); 
-        fs::write(filename, &processed_html)?;
-    }
-    return Ok(())
+    let mut options = CompileOptions::default();
+    options.source = Path::new(source);
+    options.dest = Path::new(dest);
+    options.root = Path::new(webroot);
+    return options.compile();
 }
-
-/// Recursively tries to process every file in a directory
-fn compile_dir(dir: &Path, output_dir: &Path, webroot: &str) -> Result<(), Error> {
-    let dir_entries = dir.read_dir()?;
-    for entry in dir_entries {
-        let file = entry?;
-        let file_type = file.file_type()?;
-        let new_file = output_dir.join(file.file_name());
-        if file_type.is_dir() {
-            compile_dir(&file.path(), &new_file, &webroot)?; 
-        } else if file_type.is_file() {
-            let html = process_file(&file.path(), "/")?;
-            fs::write(&new_file, &html)?;
-        } else {
-            return Err(Error{ kind: ErrorType::SimLinkFound, source: None });
-        }
-    }
-    Ok(())
-} 
 
 /// Web servers usually change their root dir before serving files. Thus, paths
 /// in html files are likely to be based on a different root, however, this
@@ -152,8 +209,10 @@ fn compile_dir(dir: &Path, output_dir: &Path, webroot: &str) -> Result<(), Error
 fn parse_path(path_in_comment: &[u8], website_root: &Path, cwd: &Path) -> Result<Box<Path>, core::str::Utf8Error> {
     let path_as_str = str::from_utf8(path_in_comment)?;
     if path_as_str.starts_with('/') {
-        return Ok(website_root.join(PathBuf::from(&path_as_str[1..])).into_boxed_path());
+        let x = Ok(website_root.join(PathBuf::from(&path_as_str[1..])).into_boxed_path());
+        return x;
     } else {
-        return Ok(cwd.join(PathBuf::from(&path_as_str)).into_boxed_path());
+        let x = Ok(cwd.join(PathBuf::from(&path_as_str)).into_boxed_path());
+        return x;
     }
 }

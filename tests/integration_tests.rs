@@ -1,29 +1,36 @@
 use htmlprep::*;
+use tempdir::TempDir;
 
-const OUTPUT_DIR: &str = "out";
-const WEBROOT: &str = ".";
+const ROOT: &str = "testdata";
+
+fn compile_file_test(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let tempdir = TempDir::new("htmlprep-test").unwrap();
+    let _ = compile(&format!("{ROOT}/{file}"), tempdir.into_path().to_str().unwrap(), ROOT)?;
+    return Ok(());
+}
 
 #[test]
-fn time() {
-    compile("tests/needle_in_haystack.html", OUTPUT_DIR, WEBROOT).unwrap();
+fn needle_in_haystack() {
+    compile_file_test("needle_in_haystack.html").unwrap();
 }
 
 #[test]
 fn bad_format() {
-    compile("tests/bad_format1.html", OUTPUT_DIR, WEBROOT).unwrap()
+    compile_file_test("bad_format1.html").unwrap(); 
 }
 
 #[test]
 fn two_includes() {
-    compile("tests/two_includes.html", OUTPUT_DIR, "/").unwrap();
+    compile_file_test("two_includes.html").unwrap();
 }
 
 #[test]
 fn two_includes2() {
-    compile("tests/two_includes2.html", OUTPUT_DIR, "/").unwrap();
+    compile_file_test("two_includes2.html").unwrap();
 }
 
 #[test]
 fn entire_test_dir() {
-    compile("tests", "all_tests", WEBROOT).unwrap();
+    let tempdir = TempDir::new("htmlprep-test").unwrap();
+    compile(ROOT, &tempdir.into_path().to_str().unwrap(), ROOT).unwrap();
 }
