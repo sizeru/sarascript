@@ -55,6 +55,7 @@ impl Default for CompileOptions<'_> {
             ]),
             skip_extensions: vec![
                 String::from("htmlsnippet"),
+                String::from("htmlprep"),
                 String::from("")
             ],
             source: Path::new("."),
