@@ -2,9 +2,9 @@ use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, syn
 use regex::bytes::{Regex, RegexBuilder, Captures};
 
 static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
-const INCLUDE_REGEX: &str = r##"<!--.*?#include\s+"([^"]+)".*?-->"##;
+const INCLUDE_REGEX: &str = r##"<!--\s?#include\s+"([^"]+)"\s*?-->"##;
 static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
-const PLACEHOLDER_REGEX: &str = r##"<!--.*?#placeholder\s+"([^"]+)".*?-->"##;
+const PLACEHOLDER_REGEX: &str = r##"<!--\s?#placeholder\s+"([^"]+)"\s*?-->"##;
 
 #[derive(Debug)]
 pub struct Error {
