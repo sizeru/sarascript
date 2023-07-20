@@ -1,6 +1,6 @@
 [package]
 name = "htmlprep"
-version = "0.0.5-a"
+version = "0.0.5-c"
 description = "IN-ALPHA: An HTML Pre-Processor for creating static HTML files"
 license = "MIT OR Apache-2.0"
 include = ["/src"]
