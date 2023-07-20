@@ -41,6 +41,7 @@ impl From<Utf8Error> for Error {
     }
 }
 
+#[derive(Debug)]
 pub struct Html {
     bytes: Vec<u8>
 }
@@ -292,6 +293,7 @@ impl Html {
     }
 }
 
+#[derive(Debug)]
 pub struct Placeholders {
     data: Vec<Placeholder>
 }
@@ -318,7 +320,7 @@ impl From<Vec<Placeholder>> for Placeholders {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Placeholder {
     start: usize,
     end: usize,
