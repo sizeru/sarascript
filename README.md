@@ -1,10 +1,29 @@
-# This is an HTML Pre-Processor for rust.
+# A lightweight declarative language for HTML
+SaraScript is a simple declarative language which can be used to extend an HTML document. SaraScript can be used as:
+- A static-site generator[1].
+- A server-side renderer[1].
+- An asynchronous client-side renderer
+###### [1]: "Rendering" in a web context is typically just modifying the HTML so that the browser may render it properly
+## Use Cases:
+Since SaraScript can be used in three distinct ways, this table compares each version:
+| Version    | Use Case                  | Pros                                        | Cons                                             |
+|------------|---------------------------|---------------------------------------------|--------------------------------------------------|
+| Server     | Server-side rendering     | No client scripts & Reduced Server Storage  | Increased Server CPU & Increased Network Traffic |
+| Client     | Client-side rendering     | Reduced server storage & Minimal server CPU | Client-side scripts                              |
+| Standalone | Static-site generation      | No client scripts & Minimal server CPU      | Larger Server Storage                            |
+| Library    | Used in custom webservers | N/a                                         | N/a                                              |
 
-## What are some use cases?
+## Example use cases
 - Adding a navbar/footer/etc. to every page
+- Retrieving and embedding a user's picture into the site
+- Generating static web pages
+
 - Inserting the same meta tags in the \<head\> on every page
 - As a library in a custom rust webserver
 - Pre-processing a directory on your local computer and copying the processed dir to a production computer
+
+## Why not use PHP?
+Mainly due to security concerns and ease-of-use. Sarascript is designed to be much simpler to use and much smaller in scope than PHP.
 
 ## Give Me More Depth on a Use Case
 Imagine that you had a static website that had a few dozen pages of information. In order to make navigation easier, you may want to include a navbar on all of your pages. You likely would like to only have to edit the navbar in one location, and have all your webpages be updated accordingly. You have a few serious options:
@@ -29,3 +48,10 @@ You could. PHP can generate static files. [Here's a script on Stack Overflow tha
 - Set root dir for includes (include paths can be based on your webserver's root)
 - All pre-processor keywords and directives are inside of comments, meaning your raw HTML code is still valid if you're into that (I am).
 - Fast enough: Can crank through over 1GB of HTML files per second on my computer. Haven't done solid benchmarking yet.
+
+## Misc
+
+This project practices semantic versioning: https://semver.org/spec/v2.0.0.html
+
+## Name
+The hero shrew is a small cute mouse-like creature with an incredibly strong spine. Though they are the size of a deck of cards - they are said to be able to support the weight of an adult male without harm. The animal is native the the DRC. musaraigne is the word for shrew in French - I was unable to find the name in Kituba. 
