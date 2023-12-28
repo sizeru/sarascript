@@ -1,8 +1,12 @@
-use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin}; 
+use std::{io::{self, Write}, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin}; 
 use async_std_openssl::SslStream;
+use async_std::{net::TcpStream, io::WriteExt, task};
+use http::Request;
+use hyper::body::Bytes;
 use regex::bytes::{Regex, RegexBuilder, Captures};
-use async_std::{net::{TcpStream, ToSocketAddrs}, io::{WriteExt, ReadExt}};
-use openssl::ssl::{Ssl, SslConnector, SslMethod}; // bindings to OpenSSL
+mod adapter;
+use adapter::HyperStream;
+use http_body_util::{Empty, BodyExt};
 
 static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
 const INCLUDE_REGEX: &str = r##"<!--\s*?#include\s+"([^"]+)"\s*?-->"##;
@@ -378,31 +382,67 @@ fn make_path_absolute(path_in_comment: &[u8], website_root: &Path, cwd: &Path) -
 
 // }
 pub async fn get(domain: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	return get_single(domain, path).await;
+	// return get_single(domain, path).await;
+	task::block_on(create_connection("test"));
+	unimplemented!();
+}
+
+pub async fn create_connection(url: &str) {
+	// Parse our URL...
+	let url = "http://httpbin.org/get".parse::<hyper::Uri>()
+		.unwrap();
+
+
+	// Get the host and the port
+	let host = url.host().expect("uri has no host");
+	let port = url.port_u16().unwrap_or(80);
+
+	let address = format!("{}:{}", host, port);
+
+	// Open a TCP connection to the remote host
+	let stream = TcpStream::connect(address).await.unwrap();
+
+	// Use an adapter to implement `hyper::rt` IO traits.
+	let mut stream = HyperStream(stream);
+
+	// Perform a TCP handshake
+	let (mut sender, conn) = hyper::client::conn::http1::handshake::<HyperStream, Empty<Bytes>>(stream).await.unwrap();
+
+	// WHAT?
+	// Spawn a task to poll the connection, driving the HTTP state
+	async_std::task::spawn(async move {
+		if let Err(err) = conn.await {
+			println!("Connection failed: {:?}", err);
+		}
+	});
+	
+	/* NO LONGER CONNECTING. I'M NOW SENDING A REQUEST */
+	// The authority of our URL will be the hostname of the httpbin remote
+	let authority = url.authority().unwrap().clone();
+
+	// Create an HTTP request with an empty body and a HOST header
+	let req = Request::builder()
+		.uri(url)
+		.header(hyper::header::HOST, authority.as_str())
+		.body(Empty::<Bytes>::new()).unwrap();
+
+	/* NO LONGER SENDING */
+	// Await the response...
+	let mut res = sender.send_request(req).await.unwrap();
+
+	println!("Response status: {}", res.status());
+
+	// Stream the body, writing each frame to stdout as it arrives
+	while let Some(next) = res.frame().await {
+		let frame = next.unwrap();
+		if let Some(chunk) = frame.data_ref() {
+			async_std::io::stdout().write_all(&chunk).await.unwrap();
+		}
+	}
+	return;
 }
 
 // Get a single 
 pub async fn get_single(domain: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	let stream = TcpStream::connect(format!("{domain}:443")).await?;
-
-	let ssl = SslConnector::builder(SslMethod::tls())?
-		.build()
-		.configure()?
-		.into_ssl(domain)?;
-	let mut stream = SslStream::new(ssl, stream)?;
-
-	Pin::new(&mut stream).connect().await?;
-
-	let request = format!(
-		"GET {path} HTTP/1.1\r\n\
-		Host: {domain}\r\n\
-		User-Agent: sara/{VERSION}\r\n\
-		Connection: close\r\n\
-		\r\n"
-	);
-
-	stream.write_all(request.as_bytes()).await?;
-	let mut response = Vec::with_capacity(50);
-	stream.read_to_end(&mut response).await?;
-	return Ok(response);
+	unimplemented!();
 }
