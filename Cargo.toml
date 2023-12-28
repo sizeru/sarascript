@@ -1,6 +1,6 @@
 [package]
 name = "htmlprep"
-version = "0.1.0-alpha3"
+version = "0.1.0-alpha4"
 description = "IN-ALPHA: An HTML Pre-Processor for creating static HTML files"
 license = "MIT OR Apache-2.0"
 include = ["/src"]
@@ -17,6 +17,5 @@ http-body-util = "0.1.0"
 hyper = { version = "1.1.0", features = ["full"] }
 openssl = "0.10.62"
 regex = "1.8.4"
-tokio = { version = "1.35.1", default-features = false } # no features
 [dev-dependencies]
 tempdir = "0.3"

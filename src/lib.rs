@@ -1,8 +1,8 @@
-use std::{io::{self, Write}, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin}; 
-use async_std_openssl::SslStream;
+use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin}; 
+use async_std::sync::{Arc, Mutex};
 use async_std::{net::TcpStream, io::WriteExt, task};
-use http::Request;
-use hyper::body::Bytes;
+use http::{Request, Response};
+use hyper::{body::{Bytes, Body, Incoming}, client::conn::http1};
 use regex::bytes::{Regex, RegexBuilder, Captures};
 mod adapter;
 use adapter::HyperStream;
@@ -12,26 +12,26 @@ static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
 const INCLUDE_REGEX: &str = r##"<!--\s*?#include\s+"([^"]+)"\s*?-->"##;
 static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
 const PLACEHOLDER_REGEX: &str = r##"<!--\s*?#placeholder\s+"([^"]+)"\s*?-->"##;
-const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const USER_AGENT: &'static str = concat!("sara/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug)]
 pub struct Error {
 	kind: ErrorType,
 	source: Option<Box<dyn error::Error>>,
 }
-type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T, E = Box<dyn error::Error + 'static + Send + Sync>> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 enum ErrorType {
-	DirExists,
-	IO,
-	Utf8Parse,
-	SimLinkFound,
-	NoFilename,
+DirExists,
+IO,
+Utf8Parse,
+SimLinkFound,
+NoFilename,
 }
 
 impl fmt::Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "Error type: {:?} caused by: {:?} ", self.kind, self.source)
 	}
 }
@@ -381,68 +381,96 @@ fn make_path_absolute(path_in_comment: &[u8], website_root: &Path, cwd: &Path) -
 // pub async fn validate_syntax(script: &str) {
 
 // }
-pub async fn get(domain: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub async fn get(domain: &str, path: &str) -> Result<()> {
 	// return get_single(domain, path).await;
-	task::block_on(create_connection("test"));
-	unimplemented!();
+	let sender = task::block_on(connect(domain, None))?;
+	let mutex = Arc::new(Mutex::new(sender));
+	let future_response = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), domain.to_owned(), path.to_owned()) );
+	let mut response = future_response.await?;
+	let future_response2 = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), domain.to_owned(), "/ip".to_owned()) );
+	let mut response2 = future_response2.await?;
+
+	while let Some(next) = response.frame().await {
+		let frame = next?;
+		if let Some(chunk) = frame.data_ref() {
+			async_std::io::stdout().write_all(&chunk).await?;
+		}
+	}
+	while let Some(next) = response2.frame().await {
+		let frame = next?;
+		if let Some(chunk) = frame.data_ref() {
+			async_std::io::stdout().write_all(&chunk).await?;
+		}
+	}
+
+	return Ok(());
 }
 
-pub async fn create_connection(url: &str) {
-	// Parse our URL...
-	let url = "http://httpbin.org/get".parse::<hyper::Uri>()
-		.unwrap();
-
-
-	// Get the host and the port
-	let host = url.host().expect("uri has no host");
-	let port = url.port_u16().unwrap_or(80);
-
-	let address = format!("{}:{}", host, port);
-
-	// Open a TCP connection to the remote host
-	let stream = TcpStream::connect(address).await.unwrap();
-
+pub async fn connect(host: &str, port: Option<u16>) -> 
+Result<http1::SendRequest<Empty<Bytes>>> {
 	// Use an adapter to implement `hyper::rt` IO traits.
-	let mut stream = HyperStream(stream);
+	let port = port.unwrap_or(443);
+	let stream = async_std::task::block_on(HyperStream::connect(host, port, None))?;
 
 	// Perform a TCP handshake
-	let (mut sender, conn) = hyper::client::conn::http1::handshake::<HyperStream, Empty<Bytes>>(stream).await.unwrap();
+	let (sender, conn) = hyper::client::conn::http1::handshake::<HyperStream, Empty<Bytes>>(stream).await.unwrap();
 
-	// WHAT?
-	// Spawn a task to poll the connection, driving the HTTP state
+	// Spawn a task to poll the connection, driving the HTTP state. Should this be async?
 	async_std::task::spawn(async move {
 		if let Err(err) = conn.await {
 			println!("Connection failed: {:?}", err);
 		}
 	});
+
+	return Ok(sender);
+}
 	
-	/* NO LONGER CONNECTING. I'M NOW SENDING A REQUEST */
-	// The authority of our URL will be the hostname of the httpbin remote
-	let authority = url.authority().unwrap().clone();
+pub async fn get_single<'a, B: Body + 'static>(sender: Arc<Mutex<http1::SendRequest<B>>>, body: B, domain: String, path: String) -> Result<Response<Incoming>>{
+	let mut sender  = sender.lock().await;
+	let request = Request::builder()
+		.uri(path)
+		.header(hyper::header::USER_AGENT, USER_AGENT)
+		.header(hyper::header::HOST, &domain)
+		// .header(hyper::header::CONNECTION, "Keep Alive")
+		.body(body)?;
 
-	// Create an HTTP request with an empty body and a HOST header
-	let req = Request::builder()
-		.uri(url)
-		.header(hyper::header::HOST, authority.as_str())
-		.body(Empty::<Bytes>::new()).unwrap();
-
-	/* NO LONGER SENDING */
 	// Await the response...
-	let mut res = sender.send_request(req).await.unwrap();
+	let response = sender.send_request(request).await?;
+	return Ok(response);
+}
 
-	println!("Response status: {}", res.status());
+pub async fn read_response(response: &mut Response<Incoming>) {
+	println!("Response status: {}", response.status());
 
 	// Stream the body, writing each frame to stdout as it arrives
-	while let Some(next) = res.frame().await {
+	while let Some(next) = response.frame().await {
 		let frame = next.unwrap();
 		if let Some(chunk) = frame.data_ref() {
 			async_std::io::stdout().write_all(&chunk).await.unwrap();
 		}
 	}
-	return;
 }
 
-// Get a single 
-pub async fn get_single(domain: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-	unimplemented!();
+impl HyperStream {
+	pub async fn connect(domain: &str, port: u16, use_tls: Option<bool>) -> Result<Self> {
+		let use_tls = match use_tls {
+			Some(val) => val,
+			None => true,
+		};
+		
+		let addr = format!("{domain}:{port}");
+		let stream = TcpStream::connect(&addr).await?;
+
+		if !use_tls {
+			return Ok(HyperStream::Plain(stream));
+		} else {
+			let ssl = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls())?
+				.build()
+				.configure()?
+				.into_ssl(domain)?;
+			let mut stream = async_std_openssl::SslStream::new(ssl, stream)?;
+			Pin::new(&mut stream).connect().await?;
+			return Ok(HyperStream::Tls(stream));
+		}
+	}
 }
