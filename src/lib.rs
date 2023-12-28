@@ -1,16 +1,21 @@
-use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap}; 
+use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin}; 
+use async_std_openssl::SslStream;
 use regex::bytes::{Regex, RegexBuilder, Captures};
+use async_std::{net::{TcpStream, ToSocketAddrs}, io::{WriteExt, ReadExt}};
+use openssl::ssl::{Ssl, SslConnector, SslMethod}; // bindings to OpenSSL
 
 static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
 const INCLUDE_REGEX: &str = r##"<!--\s*?#include\s+"([^"]+)"\s*?-->"##;
 static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
 const PLACEHOLDER_REGEX: &str = r##"<!--\s*?#placeholder\s+"([^"]+)"\s*?-->"##;
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]
 pub struct Error {
 	kind: ErrorType,
 	source: Option<Box<dyn error::Error>>,
 }
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
 enum ErrorType {
@@ -367,4 +372,37 @@ fn make_path_absolute(path_in_comment: &[u8], website_root: &Path, cwd: &Path) -
 		let x = Ok(cwd.join(PathBuf::from(&path_as_str)).into_boxed_path());
 		return x;
 	}
+}
+
+// pub async fn validate_syntax(script: &str) {
+
+// }
+pub async fn get(domain: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+	return get_single(domain, path).await;
+}
+
+// Get a single 
+pub async fn get_single(domain: &str, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+	let stream = TcpStream::connect(format!("{domain}:443")).await?;
+
+	let ssl = SslConnector::builder(SslMethod::tls())?
+		.build()
+		.configure()?
+		.into_ssl(domain)?;
+	let mut stream = SslStream::new(ssl, stream)?;
+
+	Pin::new(&mut stream).connect().await?;
+
+	let request = format!(
+		"GET {path} HTTP/1.1\r\n\
+		Host: {domain}\r\n\
+		User-Agent: sara/{VERSION}\r\n\
+		Connection: close\r\n\
+		\r\n"
+	);
+
+	stream.write_all(request.as_bytes()).await?;
+	let mut response = Vec::with_capacity(50);
+	stream.read_to_end(&mut response).await?;
+	return Ok(response);
 }
