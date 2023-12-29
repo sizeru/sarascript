@@ -3,7 +3,7 @@ use async_std::task;
 
 fn main() {
 	let domain = String::from("httpbin.org");
-	let response = task::block_on(parse_file("example.html")).unwrap();
+	let response = task::block_on(parse_file("simple.html")).unwrap();
 	let response_string = String::from_utf8(response).unwrap();
 	println!("Response: \n{response_string}");
 

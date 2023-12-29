@@ -14,8 +14,11 @@ static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
 const PLACEHOLDER_REGEX: &str = r##"<!--\s*?#placeholder\s+"([^"]+)"\s*?-->"##;
 static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
 
-const SCRIPT_REGEX: &str = r##"<script[^>]+type=[\W]*"sarascript">(.*?)</script>"##;
+const SCRIPT_REGEX: &str = r##"<script[^>]+type=\W*"sarascript">(.*?)</script>"##;
 static RE_SCRIPT: OnceLock<Regex> = OnceLock::new();
+
+const GET_REGEX: &str = r##"get\W*\(\W*"(.*?)"\W*\);"##;
+static RE_GET: OnceLock<Regex> = OnceLock::new();
 
 const USER_AGENT: &'static str = concat!("sara/", env!("CARGO_PKG_VERSION"));
 
@@ -28,11 +31,12 @@ type Result<T, E = Box<dyn error::Error + 'static + Send + Sync>> = std::result:
 
 #[derive(Debug)]
 enum ErrorType {
-DirExists,
-IO,
-Utf8Parse,
-SimLinkFound,
-NoFilename,
+	DirExists,
+	IO,
+	Utf8Parse,
+	SimLinkFound,
+	NoFilename,
+	TEMP
 }
 
 impl fmt::Display for Error {
@@ -54,6 +58,21 @@ impl From<Utf8Error> for Error {
 		Error{kind: ErrorType::Utf8Parse, source: Some(Box::new(error))}
 	}
 }
+
+impl From<Box<dyn std::error::Error>> for Error {
+	fn from(value: Box<dyn std::error::Error>) -> Self {
+		Error{kind: ErrorType::TEMP, source: Some(value) }
+	}
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for Error {
+	fn from(value: Box<dyn std::error::Error + Send + Sync>) -> Self {
+		Error{kind: ErrorType::TEMP, source: Some(value) }
+	}
+}
+
+unsafe impl std::marker::Send for Error {}
+unsafe impl Sync for Error {}
 
 #[derive(Debug)]
 pub struct Html {
@@ -411,30 +430,34 @@ pub async fn parse_file(filename: &str) -> Result<Vec<u8>> {
 // will exist in the spawned tasks. Once all tasks have executed, the reference
 // will terminate.
 pub fn begin_parsing(text: Vec<u8>) -> Result<FutureDocument> {
-		let re_placeholder = RE_SCRIPT.get_or_init(|| RegexBuilder::new(SCRIPT_REGEX)
-			.dot_matches_new_line(true)
-			.build()
-			.unwrap()
+	let re_placeholder = init_regex(SCRIPT_REGEX, &RE_SCRIPT);
+
+	let wip_doc = Arc::new(Mutex::new(WipDocument::new(text.clone())));
+	let text: Arc<[u8]> = text.into();
+	let mut join_handles = Vec::new();
+
+	let mut scripts = Vec::new();
+	for capture in  re_placeholder.captures_iter(&text) {
+		let tag = unsafe{ capture.get(0).unwrap_unchecked() };
+		let script = unsafe{ capture.get(1).unwrap_unchecked() };
+		join_handles.push(task::spawn(parse_script(text.clone(), tag.range(), script.range(), wip_doc.clone())));
+		scripts.push(
+			&text[script.start()..script.end()]
 		);
-
-		let wip_doc = Arc::new(Mutex::new(WipDocument::new(text.clone())));
-		let text: Arc<[u8]> = text.into();
-		let mut join_handles = Vec::new();
-
-		let mut scripts = Vec::new();
-		for capture in  re_placeholder.captures_iter(&text) {
-			let tag = unsafe{ capture.get(0).unwrap_unchecked() };
-			let script = unsafe{ capture.get(1).unwrap_unchecked() };
-			join_handles.push(task::spawn(parse_script(text.clone(), tag.range(), script.range(), wip_doc.clone())));
-			scripts.push(
-				&text[script.start()..script.end()]
-			);
-		}
-		
-		let document = FutureDocument { join_handles, document: wip_doc };
-		return Ok(document);
+	}
+	
+	let document = FutureDocument { join_handles, document: wip_doc };
+	return Ok(document);
 }
 
+pub fn init_regex(pattern: &str, regex: &'static OnceLock<Regex>) -> &'static Regex {
+	let compiled_regex = regex.get_or_init(|| RegexBuilder::new(pattern)
+		.dot_matches_new_line(true)
+		.build()
+		.unwrap()
+	);
+	return compiled_regex;
+}
 pub struct WipDocument {
 	doc: Vec<u8>,
 	edits: Vec<DocEdit>, // This vector is sorted
@@ -512,8 +535,10 @@ impl WipDocument {
 pub async fn parse_script(text: Arc<[u8]>, tag_range: Range<usize>, script_range: Range<usize>, wip_doc: Arc<Mutex<WipDocument>>) -> Result<()> {
 	let script = &text[script_range];
 	let operation = parse_syntax(script);
+	println!("Operation: {:#?}", operation);
 	let resource = match operation.opcode {
 		Opcode::GET => get(operation.args).await?,
+		Opcode::NOP => return Ok(())
 	};
 
 	// Edit document. For safety, before editing document, must either:
@@ -527,32 +552,57 @@ pub async fn parse_script(text: Arc<[u8]>, tag_range: Range<usize>, script_range
 	return Ok(());
 }
 
+#[derive(Debug)]
 enum Opcode {
+	NOP,
 	GET,
 }
 
+#[derive(Debug)]
 struct Operation {
 	opcode: Opcode,
 	args: Vec<String>,
 }
 
 fn parse_syntax(script: &[u8]) -> Operation {
-	//! TODO: This is a placeholder. Syntax Parsing has been unimplemented.
-	return Operation {
-		opcode: Opcode::GET,
-		args: vec!["httpbin.org".to_owned(), "/ip".to_owned()],
-	};
+	// TODO: The system is limited to only capturing one operation per group right now.
+	// TODO: This should probably parse to a syntax tree rather than an 'Operation'
+	println!("PARSING: {}", String::from_utf8_lossy(script));
+	let get_regex = init_regex(GET_REGEX, &RE_GET);
+	match get_regex.captures(script) {
+    Some(capture) => return Operation {
+			opcode: Opcode::GET,
+			args: vec![String::from_utf8_lossy(capture.get(1).unwrap().as_bytes()).to_string()]
+		},
+		None => return Operation {
+			opcode: Opcode::NOP,
+			args: Vec::new(), 
+		}
+	}
 }
 
 async fn get(args: Vec<String>) -> Result<Vec<u8>> {
 	// TODO: Connection should be reused when possible
 	// TODO: Need to check if accumulating this much info can hurt memory usage
-	let domain = args.get(0).unwrap();
-	let path = args.get(1).unwrap();
+	let uri: hyper::Uri = args.get(0).expect("No uri???").parse()?;
+	let host = uri.host().unwrap_or_else(|| {
+		// TODO: No host means either:
+		// 1. We are running on the server and can query locally
+		// 2. We are running on the client and want to query the current host's server
+		"httpbin.org"
+	});
+	let port = match uri.port() {
+		Some(port) => port.as_u16(),
+		None => 443,
+	};
+	let path_and_query = match uri.path_and_query() {
+		Some(path_and_query) => path_and_query.as_str(),
+		None => "/"
+	};
 
-	let sender = task::block_on(connect(&domain, None))?;
+	let sender = task::block_on(connect(host, Some(port)))?;
 	let mutex = Arc::new(Mutex::new(sender));
-	let future_response = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), domain.clone(), path.clone()));
+	let future_response = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), host.to_owned(), path_and_query.to_owned()));
 	let mut response = future_response.await?;
 
 	let mut text = Vec::new();
@@ -571,7 +621,7 @@ pub async fn connect(host: &str, port: Option<u16>) ->
 Result<http1::SendRequest<Empty<Bytes>>> {
 	// Use an adapter to implement `hyper::rt` IO traits.
 	let port = port.unwrap_or(443);
-	let stream = async_std::task::block_on(HyperStream::connect(host, port, None))?;
+	let stream = async_std::task::block_on(HyperStream::connect(host, port, Some(true)))?;
 
 	// Perform a TCP handshake
 	let (sender, conn) = hyper::client::conn::http1::handshake::<HyperStream, Empty<Bytes>>(stream).await.unwrap();
