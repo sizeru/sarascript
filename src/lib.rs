@@ -1,5 +1,5 @@
-use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin}; 
-use async_std::sync::{Arc, Mutex};
+use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap, pin::Pin, ops::Range};
+use async_std::{sync::{Arc, Mutex}, task::JoinHandle};
 use async_std::{net::TcpStream, io::WriteExt, task};
 use http::{Request, Response};
 use hyper::{body::{Bytes, Body, Incoming}, client::conn::http1};
@@ -8,10 +8,15 @@ mod adapter;
 use adapter::HyperStream;
 use http_body_util::{Empty, BodyExt};
 
-static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
 const INCLUDE_REGEX: &str = r##"<!--\s*?#include\s+"([^"]+)"\s*?-->"##;
-static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
+
 const PLACEHOLDER_REGEX: &str = r##"<!--\s*?#placeholder\s+"([^"]+)"\s*?-->"##;
+static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+
+const SCRIPT_REGEX: &str = r##"<script[^>]+type=[\W]*"sarascript">(.*?)</script>"##;
+static RE_SCRIPT: OnceLock<Regex> = OnceLock::new();
+
 const USER_AGENT: &'static str = concat!("sara/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug)]
@@ -378,32 +383,188 @@ fn make_path_absolute(path_in_comment: &[u8], website_root: &Path, cwd: &Path) -
 	}
 }
 
-// pub async fn validate_syntax(script: &str) {
+pub struct FutureDocument {
+	join_handles: Vec<JoinHandle<Result<()>>>,
+	document: Arc<Mutex<WipDocument>>
+}
 
-// }
-pub async fn get(domain: &str, path: &str) -> Result<()> {
-	// return get_single(domain, path).await;
-	let sender = task::block_on(connect(domain, None))?;
+impl FutureDocument {
+	// Block until all tasks have run to completion
+	pub async fn join_all(self) -> Result<Vec<u8>> {
+		for handle in self.join_handles {
+			handle.await?;
+		}
+		let mutex = Arc::into_inner(self.document).unwrap();
+		let doc = mutex.into_inner();
+		return Ok(doc.doc);
+	}
+}
+
+pub async fn parse_file(filename: &str) -> Result<Vec<u8>> {
+	let bytes = async_std::fs::read(filename).await?;
+	let document = begin_parsing(bytes)?;
+	let parsed = document.join_all().await?;
+	return Ok(parsed);
+}
+
+// Move the Arc so that its reference is dropped. The only remaining reference
+// will exist in the spawned tasks. Once all tasks have executed, the reference
+// will terminate.
+pub fn begin_parsing(text: Vec<u8>) -> Result<FutureDocument> {
+		let re_placeholder = RE_SCRIPT.get_or_init(|| RegexBuilder::new(SCRIPT_REGEX)
+			.dot_matches_new_line(true)
+			.build()
+			.unwrap()
+		);
+
+		let wip_doc = Arc::new(Mutex::new(WipDocument::new(text.clone())));
+		let text: Arc<[u8]> = text.into();
+		let mut join_handles = Vec::new();
+
+		let mut scripts = Vec::new();
+		for capture in  re_placeholder.captures_iter(&text) {
+			let tag = unsafe{ capture.get(0).unwrap_unchecked() };
+			let script = unsafe{ capture.get(1).unwrap_unchecked() };
+			join_handles.push(task::spawn(parse_script(text.clone(), tag.range(), script.range(), wip_doc.clone())));
+			scripts.push(
+				&text[script.start()..script.end()]
+			);
+		}
+		
+		let document = FutureDocument { join_handles, document: wip_doc };
+		return Ok(document);
+}
+
+pub struct WipDocument {
+	doc: Vec<u8>,
+	edits: Vec<DocEdit>, // This vector is sorted
+}
+
+#[derive(Eq)]
+pub struct DocEdit {
+	index: usize,
+	edit_length: i32,
+}
+
+impl WipDocument {
+	pub fn new(doc: Vec<u8>) -> Self {
+		WipDocument {
+			doc,
+			edits: Vec::new(),
+		}	
+	}
+}
+
+impl Ord for DocEdit {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		return self.index.cmp(&other.index);
+	}
+}
+
+impl PartialOrd for DocEdit {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		match self.index.partial_cmp(&other.index) {
+			Some(core::cmp::Ordering::Equal) => {}
+			ord => return ord,
+		}
+		self.edit_length.partial_cmp(&other.edit_length)
+	}
+}
+
+impl PartialEq for DocEdit {
+	fn eq(&self, other: &Self) -> bool {
+		return self.index == other.index;
+	}
+}
+
+impl WipDocument {
+	pub fn insert_edit(&mut self, index: usize, edit_length: i32) {
+		let edit = DocEdit {index, edit_length};
+		if let Err(insert_index) = self.edits.binary_search(&edit) {
+			self.edits.insert(insert_index, edit);
+		}
+	}
+
+	pub fn sum_edits_before_index(&self, index: usize) -> i32 {
+		let index = match self.edits.binary_search(&DocEdit{index, edit_length:0}) {
+			Ok(index) => index,
+			Err(index) => index,
+		};
+		let edits = &self.edits[0..index];
+		let mut sum = 0;
+		for edit in edits {
+			sum += edit.edit_length
+		}
+		return sum;
+	}
+
+	// Insert a resource into this document
+	// TODO: The as [integers] in this function have the potential for undefined behavior
+	pub fn insert(&mut self, resource: Vec<u8>, tag_range: Range<usize>) { 
+		let sum_edit_len = self.sum_edits_before_index(tag_range.start);
+		self.insert_edit(tag_range.start, resource.len() as i32 - tag_range.len() as i32);
+		let wip_tag_start: usize = tag_range.start.wrapping_add(sum_edit_len as usize);
+		let wip_tag_end: usize = tag_range.end.wrapping_add(sum_edit_len as usize);
+		self.doc.splice(wip_tag_start..wip_tag_end, resource);
+	}
+}
+
+pub async fn parse_script(text: Arc<[u8]>, tag_range: Range<usize>, script_range: Range<usize>, wip_doc: Arc<Mutex<WipDocument>>) -> Result<()> {
+	let script = &text[script_range];
+	let operation = parse_syntax(script);
+	let resource = match operation.opcode {
+		Opcode::GET => get(operation.args).await?,
+	};
+
+	// Edit document. For safety, before editing document, must either:
+	// - Wait for parsing of document to finish.
+	// - Edit some shared data which indicates to other threads how the threads have moved. <--- THIS IS PREFERRED THEREFORE:
+	//		Need a vector which has indices where change happens, and the amount that the change is.
+	{
+		let mut doc = wip_doc.lock().await;
+		doc.insert(resource, tag_range);
+	}
+	return Ok(());
+}
+
+enum Opcode {
+	GET,
+}
+
+struct Operation {
+	opcode: Opcode,
+	args: Vec<String>,
+}
+
+fn parse_syntax(script: &[u8]) -> Operation {
+	//! TODO: This is a placeholder. Syntax Parsing has been unimplemented.
+	return Operation {
+		opcode: Opcode::GET,
+		args: vec!["httpbin.org".to_owned(), "/ip".to_owned()],
+	};
+}
+
+async fn get(args: Vec<String>) -> Result<Vec<u8>> {
+	// TODO: Connection should be reused when possible
+	// TODO: Need to check if accumulating this much info can hurt memory usage
+	let domain = args.get(0).unwrap();
+	let path = args.get(1).unwrap();
+
+	let sender = task::block_on(connect(&domain, None))?;
 	let mutex = Arc::new(Mutex::new(sender));
-	let future_response = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), domain.to_owned(), path.to_owned()) );
+	let future_response = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), domain.clone(), path.clone()));
 	let mut response = future_response.await?;
-	let future_response2 = task::spawn( get_single(mutex.clone(), Empty::<Bytes>::new(), domain.to_owned(), "/ip".to_owned()) );
-	let mut response2 = future_response2.await?;
 
+	let mut text = Vec::new();
 	while let Some(next) = response.frame().await {
 		let frame = next?;
 		if let Some(chunk) = frame.data_ref() {
-			async_std::io::stdout().write_all(&chunk).await?;
-		}
-	}
-	while let Some(next) = response2.frame().await {
-		let frame = next?;
-		if let Some(chunk) = frame.data_ref() {
-			async_std::io::stdout().write_all(&chunk).await?;
+			text.reserve(chunk.len());
+			text.write(chunk).await?;
 		}
 	}
 
-	return Ok(());
+	return Ok(text);
 }
 
 pub async fn connect(host: &str, port: Option<u16>) -> 
@@ -431,7 +592,7 @@ pub async fn get_single<'a, B: Body + 'static>(sender: Arc<Mutex<http1::SendRequ
 		.uri(path)
 		.header(hyper::header::USER_AGENT, USER_AGENT)
 		.header(hyper::header::HOST, &domain)
-		// .header(hyper::header::CONNECTION, "Keep Alive")
+		// .header(hyper::header::CONNECTION, "close")
 		.body(body)?;
 
 	// Await the response...

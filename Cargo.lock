@@ -511,7 +511,7 @@ checksum = "d77f7ec81a6d05a3abb01ab6eb7590f6083d08449fe5a1c8b1e620283546ccb7"
 
 [[package]]
 name = "htmlprep"
-version = "0.1.0-alpha4"
+version = "0.1.0-alpha5"
 dependencies = [
  "async-std",
  "async-std-openssl",
