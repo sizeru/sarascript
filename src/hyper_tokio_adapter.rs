@@ -8,8 +8,9 @@ use std::{
 use hyper::rt::{Read, Write};
 use tokio::{
 	io::{AsyncRead, AsyncWrite},
-	net::TcpStream,
+	net::TcpStream, task::block_in_place,
 };
+use crate::ConfigSettings;
 
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_rustls::rustls::{pki_types, ClientConfig, RootCertStore};
@@ -46,7 +47,6 @@ impl Read for HyperStream {
 }
 
 impl Write for HyperStream {
-
 	fn poll_write( self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
 		match self.get_mut() {
 			HyperStream::Plain(ref mut stream) => Pin::new(stream).poll_write(cx, buf),
@@ -73,15 +73,24 @@ impl Write for HyperStream {
 impl HyperStream {
 	pub async fn connect(domain: &str, port: u16, use_tls: bool) -> Result<Self> {
 		
-		let addr = format!("{domain}:{port}");
-		let stream = TcpStream::connect(&addr).await?;
+		let config = ConfigSettings::get().await;
+		let resolver = block_in_place(|| async {
+			hickory_resolver::TokioAsyncResolver::tokio(
+				hickory_resolver::config::ResolverConfig::default(),
+				hickory_resolver::config::ResolverOpts::default()
+			)
+		}).await;
+		let response = resolver.lookup_ip(domain).await?;
+		let address = response.iter().next().unwrap();
+		let stream = TcpStream::connect((address, port)).await?;
 
 		if !use_tls {
 			return Ok(HyperStream::Plain(stream));
 		} else {
-			let ca_file = "/etc/ssl/cert.pem"; // TODO: Fix this: It is not portable
+			// Let user specify ca_file
+
 			// Read the certificate authority filemove || {
-			let root_cert_store = read_certificate_authority_file(ca_file)?;
+			let root_cert_store = read_certificate_authority_file(&config.certificate_authorities_filename)?;
 			let config = ClientConfig::builder()
 				.with_root_certificates(root_cert_store)
 				.with_no_client_auth(); // i guess this was previously the default?

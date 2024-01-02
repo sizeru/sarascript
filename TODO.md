@@ -5,6 +5,5 @@
 - Create CLIENT version somehow???
 
 - Need to stop failed requests from panicking
-- Need to enable comments in parsing
 
 - Need to put a little more work into the TLS implementation.

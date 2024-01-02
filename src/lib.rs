@@ -4,8 +4,9 @@ use std::{
 	sync::Arc,
 	ops::Range,
 };
+use log::info;
 use tokio::{
-	sync::Mutex,
+	sync::{Mutex, OnceCell},
 	task::{self, JoinHandle},
 	io::AsyncWriteExt,
 };
@@ -13,17 +14,74 @@ use http::{Request, Uri};
 use hyper::body::Bytes;
 use pest_derive::Parser;
 use pest::{Parser, iterators::Pair};
-mod hyper_tokio_adapter;
-use hyper_tokio_adapter::HyperStream;
 use http_body_util::{Empty, BodyExt};
+use config::{Config, FileFormat};
 
-const USER_AGENT: &'static str = concat!("sara/", env!("CARGO_PKG_VERSION"));
+pub mod hyper_tokio_adapter;
+pub mod server;
+use hyper_tokio_adapter::HyperStream;
+
+const USER_AGENT: &str = concat!("sara/", env!("CARGO_PKG_VERSION"));
+const LOG_FILE: &str = "/var/log/sarascriptd/sarascriptd.log";
+const PID_FILE: &str = "/var/run/sarascriptd.pid";
+static CONFIG: OnceCell<ConfigSettings> = OnceCell::const_new();
 
 #[derive(Parser)]
 #[grammar = "sarascript.pest"]
 pub struct SaraParser;
 
 type Result<T, E = Box<dyn error::Error + 'static + Send + Sync>> = std::result::Result<T, E>;
+
+const CONFIG_FILE: &str = "/etc/sarascriptd.conf";
+#[derive(Debug)]
+pub struct ConfigSettings {
+	user: String,
+	root: String,
+	default_host: String,
+	server_side_rendering_enabled: bool,
+	port: u16,
+	client_side_rendering_enabled: bool,
+	log_filename: String,
+	pid_filename: String,
+	certificate_authorities_filename: String,
+}
+
+impl ConfigSettings {
+	pub fn read(config_filename: &str) -> ConfigSettings {
+		let config = Config::builder()
+			.add_source(config::File::new(config_filename, FileFormat::Toml))
+			.build()
+			.expect(&format!("Could not read config at {CONFIG_FILE}"));
+		let root = config.get_string("root").expect("Could not find root in config");
+		let user = config.get_string("user").expect("Could not find user in config");
+		let default_host = config.get_string("default_host").expect("Could not find the default host in config");
+		let client_side_rendering_enabled = config.get_bool("client_side_rendering").unwrap_or(false);
+		let server_side_rendering_enabled = config.get_bool("server_side_rendering").unwrap_or(false);
+		let port = config.get_int("port").expect("Could not find port in config, but server_side_rendering is enabled") as u16;
+		let log_filename = config.get_string("log_filename").unwrap_or(LOG_FILE.to_string());
+		let pid_filename = config.get_string("pid_filename").unwrap_or(PID_FILE.to_string());
+		let cafile = config.get_string("certificate_authorities").expect("Could not find server's certificate authorities file in config");
+
+		let config = ConfigSettings {
+			user,
+			root,
+			default_host,
+			server_side_rendering_enabled,
+			port,
+			client_side_rendering_enabled,
+			log_filename,
+			pid_filename,
+			certificate_authorities_filename: cafile,
+		};
+
+		return config;
+	}
+
+	pub async fn get() -> &'static ConfigSettings {
+		CONFIG.get_or_init(|| async { task::block_in_place(|| ConfigSettings::read(CONFIG_FILE)) }).await
+	}
+}
+
 
 pub struct Document {
 	pub contents: Vec<u8>
@@ -56,28 +114,6 @@ impl FutureDocument {
 		return Ok( Document { contents: doc.contents });
 	}
 }
-
-// impl Future for FutureDocument {
-// 	type Output = Result<Document>;
-
-// 	fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-// 		let this = self.get_mut();
-// 		let remaining_handles = &mut this.join_handles[this._current_handle_index..];
-
-// 		for mut handle in remaining_handles {
-// 			if let Poll::Pending =  Pin::new(&mut handle).poll(cx) {
-// 				return Poll::Pending;
-// 			}
-// 			this._current_handle_index += 1;
-// 		}
-
-// 		println!("Done processing: index is {}", this._current_handle_index);
-// 		let arc = &this.wip_document;
-// 		let final_document = arc.try_lock().unwrap();
-// 		let doc = Document { contents: final_document.contents.clone() }; //TODO: Not a big fan of this clone here
-// 		return Poll::Ready(Ok(doc));
-// 	}
-// }
 
 pub async fn parse_file(filename: &str) -> Result<Document> {
 	let bytes = tokio::fs::read(filename).await?;
@@ -328,19 +364,38 @@ enum Arg {
 	Symbol(String),
 }
 
+impl Arg {
+	// TODO: This could be more effecient, but would be a micro-optimization
+	unsafe fn into_inner_string(&self) -> String {
+		match self {
+			Arg::String(string) => string.clone(),
+			_ => unreachable!()
+		}
+	}
+
+	unsafe fn into_inner_num(&self) -> i64 {
+		match self {
+			Arg::Num(num) => num.clone(),
+			_ => unreachable!()
+		}
+	}
+
+	unsafe fn into_inner_symbol(&self) -> String {
+		match self {
+			Arg::Symbol(symbol) => symbol.clone(),
+			_ => unreachable!()
+		}
+	}
+}
+
 async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 	// TODO: Connection should be reused when possible
-	let uri: Uri = if let Arg::String(uri_string) = args.get(0).expect("No argument passed to get?") {
-		uri_string.parse()?
-	} else {
-		panic!("This is an error");
-	};
+	let config = ConfigSettings::get().await;
+	let uri_string = unsafe { args.get(0).unwrap_unchecked().into_inner_string() }; // Safe due to parsing guarantees
+	let uri: Uri = uri_string.parse()?;
+	info!("sarascript::get() -> {}", uri.to_string());
 	let host = uri.host().unwrap_or_else(|| {
-		// TODO: No host means either:
-		// 1. We are running on the server and can query locally
-		// 2. We are running on the client and want to query the current host's server
-		// Either way, for now default to httpbin lol
-		"httpbin.org"
+		&config.default_host
 	});
 	let port = match uri.port() {
 		Some(port) => port.as_u16(),
