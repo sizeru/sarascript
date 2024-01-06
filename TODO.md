@@ -7,3 +7,5 @@
 - Need to stop failed requests from panicking
 
 - Need to put a little more work into the TLS implementation.
+
+- Poorly formatted scripts result in the closing of the connection. I can't imagine this being desirable behavior, but quiet failures lead to oversights. Think about how to resolve this.

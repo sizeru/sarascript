@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "htmlprep"
-version = "0.1.0-alpha8"
+version = "0.1.0-alpha9"
 dependencies = [
  "anyhow",
  "config",

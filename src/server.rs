@@ -1,23 +1,36 @@
-use std::{net::SocketAddr, convert::Infallible, sync::Arc};
+use std::{net::SocketAddr, convert::Infallible};
 use anyhow::anyhow;
 use daemonize::Daemonize;
 use http_body_util::Full;
 use log::{info, warn, error};
-use tokio::net::TcpListener;
+use tokio::{
+	net::TcpListener,
+	fs,
+	io,
+};
 use hyper::{server::conn::http1, Request, Response, service::service_fn, StatusCode, Method, body::Bytes};
 
 use crate::{
 	hyper_tokio_adapter::HyperStream,
-	parse_file,
+	parse_text,
+	// parse_text2,
 	ConfigSettings,
-	CONFIG_FILE,
+	CONFIG_PATH,
 };
 
 const LOCALHOST: [u8; 4] = [127, 0, 0, 1];
 
+// Run server without creating a daemon (as logged in user). Useful for debugging.
+pub fn run_server() {
+	let config = ConfigSettings::init(CONFIG_PATH).unwrap();
+	std::os::unix::fs::chroot(&config.root).unwrap();
+	// TODO: Should init logger to print to stdout
+	run();
+}
 
+// Create a deamon and launch the server. This shouldbe used in production.
 pub fn launch_server() {
-	let config = ConfigSettings::read(CONFIG_FILE);
+	let config = ConfigSettings::init(CONFIG_PATH).unwrap();
 	let daemon = create_daemon(&config);
 
 	match daemon.start() {
@@ -25,11 +38,11 @@ pub fn launch_server() {
 		Err(e) => panic!("Could not daemonize due to error: {e}"),
 	}
 
-	run(config);
+	run();
 }
 
 
-pub fn create_daemon(config: &ConfigSettings) -> Daemonize<()> {
+fn create_daemon(config: &ConfigSettings) -> Daemonize<()> {
 	let log_filename = config.log_filename.clone();
 	let daemon = Daemonize::new()
 		.chroot(&config.root)
@@ -52,9 +65,9 @@ pub fn create_daemon(config: &ConfigSettings) -> Daemonize<()> {
 }
 
 #[tokio::main]
-pub async fn run(config: ConfigSettings) {
+async fn run() {
+	let config = unsafe { ConfigSettings::get_unchecked() };
 	let addr = SocketAddr::from((LOCALHOST, config.port)); // Always bind to local loopback.
-	let config = Arc::new(config);
 	let listener = TcpListener::bind(addr).await.expect("Could not bind TCP Listener");
 	// TODO: Would a new struct which implements Tcp Listening be useful?
 
@@ -68,7 +81,6 @@ pub async fn run(config: ConfigSettings) {
 		};
 
 		let stream = HyperStream::Plain(stream);
-		let new_config = config.clone();
 
 		// Spawn a tokio task to serve multiple connections concurrently
 		tokio::task::spawn(async move {
@@ -77,7 +89,7 @@ pub async fn run(config: ConfigSettings) {
 				// `service_fn` converts our function in a `Service`
 				.serve_connection(
 					stream, 
-					service_fn(move |request| respond(request, new_config.clone()))
+					service_fn(move |request| respond(request))
 				).await
 			{
 				error!("Error serving connection: {err}");
@@ -86,12 +98,12 @@ pub async fn run(config: ConfigSettings) {
 	}
 }
 
-async fn respond(request: Request<hyper::body::Incoming>, config: Arc<ConfigSettings>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn respond(request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
 	// We offload this to another request since the returned result has an
 	// Infallible error. We can have more ergonomic error handling by handling it
 	// in another function.
 
-	match handle_request(&request, config).await {
+	match handle_request(&request).await {
 		Ok(response) => {
 			info!("Serving request for: {:?}", request.uri());
 			return Ok(response)
@@ -103,17 +115,26 @@ async fn respond(request: Request<hyper::body::Incoming>, config: Arc<ConfigSett
 	}
 }
 
-async fn handle_request(req: &Request<hyper::body::Incoming>, config: Arc<ConfigSettings>) -> Result<Response<Full<Bytes>>, anyhow::Error> {
+async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, anyhow::Error> {
+	let config = unsafe { ConfigSettings::get_unchecked() };
 	let uri = req.uri();
-	let host = uri.host().unwrap_or(&config.default_host);
+	let host = uri.host().unwrap_or(&config.default_authority);
 	let path = uri.path();
 	let query = uri.query().unwrap_or("");
 
-	let _server_host = &config.default_host;
+	let _server_host = &config.default_authority;
 	match (req.method(), host, path, query) {
 		(&Method::GET, _server_host, _, "") => {
+			let file_contents = match read_file_or_index(path).await {
+				Ok(bytes) => bytes,
+				Err(e) => return Err(anyhow!("File could not be accessed or does not exist: {}", e)),
+			};
 			if config.server_side_rendering_enabled {
-				let document = match parse_file(path).await {
+				let future_doc = match parse_text(file_contents) {
+					Ok(future_doc) => future_doc,
+					Err(e) => return Err(anyhow!(format!("Failed to begin parsing document due to: {}", e))),
+				};
+				let document = match future_doc.join_all().await {
 					Ok(doc) => doc,
 					Err(e) => return Err(anyhow!(format!("Could not parse document due to: {}", e)))
 				};
@@ -126,6 +147,18 @@ async fn handle_request(req: &Request<hyper::body::Incoming>, config: Arc<Config
 			return Err(anyhow!(format!("I don't know how to respond to the requested uri")));
 		},
 	}
+}
+
+async fn read_file_or_index(path: &str) -> Result<Vec<u8>, io::Error> {
+	// Check if a file named `path`` exists
+	if let Ok(bytes) = fs::read(path).await { return Ok(bytes) } 
+	// Check if a file named `path`.html exists
+	if !path.ends_with("/") {
+		if let Ok(bytes) = fs::read(format!("{path}.html")).await { return Ok(bytes) } 
+	}
+	// Check if either `path`/index.html or `path`index.html exists
+	let index_file = if path.ends_with("/") { format!("{path}index.html") } else { format!("{path}/index.html") };
+	return fs::read(index_file).await;
 }
 
 fn error_response(err: &anyhow::Error) -> Response<Full<Bytes>> {

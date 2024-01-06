@@ -1,5 +1,4 @@
 use std::{
-	error,
 	str,
 	sync::Arc,
 	ops::Range,
@@ -18,26 +17,29 @@ use http_body_util::{Empty, BodyExt};
 use config::{Config, FileFormat};
 
 pub mod hyper_tokio_adapter;
-pub mod server;
 use hyper_tokio_adapter::HyperStream;
+#[cfg(feature = "server")]
+pub mod server;
+mod error;
+use error::SaraError;
+
+type Result<T, E = SaraError> = std::result::Result<T, E>;
 
 const USER_AGENT: &str = concat!("sara/", env!("CARGO_PKG_VERSION"));
 const LOG_FILE: &str = "/var/log/sarascriptd/sarascriptd.log";
 const PID_FILE: &str = "/var/run/sarascriptd.pid";
+const CONFIG_PATH: &str = "/etc/sarascriptd.conf";
 static CONFIG: OnceCell<ConfigSettings> = OnceCell::const_new();
 
 #[derive(Parser)]
 #[grammar = "sarascript.pest"]
 pub struct SaraParser;
 
-type Result<T, E = Box<dyn error::Error + 'static + Send + Sync>> = std::result::Result<T, E>;
-
-const CONFIG_FILE: &str = "/etc/sarascriptd.conf";
 #[derive(Debug)]
-pub struct ConfigSettings {
+struct ConfigSettings {
 	user: String,
 	root: String,
-	default_host: String,
+	default_authority: String,
 	server_side_rendering_enabled: bool,
 	port: u16,
 	client_side_rendering_enabled: bool,
@@ -47,25 +49,39 @@ pub struct ConfigSettings {
 }
 
 impl ConfigSettings {
-	pub fn read(config_filename: &str) -> ConfigSettings {
+	// Read and parse a config from the filesystem. This should probably only ever be called once.
+	pub fn read(config_filename: &str) -> Result<ConfigSettings> {
 		let config = Config::builder()
 			.add_source(config::File::new(config_filename, FileFormat::Toml))
-			.build()
-			.expect(&format!("Could not read config at {CONFIG_FILE}"));
-		let root = config.get_string("root").expect("Could not find root in config");
-		let user = config.get_string("user").expect("Could not find user in config");
-		let default_host = config.get_string("default_host").expect("Could not find the default host in config");
+			.build()?;
+		return ConfigSettings::parse(config);
+	}
+
+	pub async fn read_async(config_filename: &str) -> Result<ConfigSettings> {
+		let config_filename_clone = config_filename.to_owned();
+		let config = task::spawn_blocking(move || {
+			Config::builder()
+				.add_source(config::File::new(&config_filename_clone, FileFormat::Toml))
+				.build()
+		}).await??;
+		return ConfigSettings::parse(config);
+	}
+
+	fn parse(config: Config) -> Result<ConfigSettings> {
+		let root = config.get_string("root")?;
+		let user = config.get_string("user")?;
+		let default_authority = config.get_string("default_authority")?;
 		let client_side_rendering_enabled = config.get_bool("client_side_rendering").unwrap_or(false);
 		let server_side_rendering_enabled = config.get_bool("server_side_rendering").unwrap_or(false);
-		let port = config.get_int("port").expect("Could not find port in config, but server_side_rendering is enabled") as u16;
+		let port = config.get_int("port")? as u16; 
 		let log_filename = config.get_string("log_filename").unwrap_or(LOG_FILE.to_string());
 		let pid_filename = config.get_string("pid_filename").unwrap_or(PID_FILE.to_string());
-		let cafile = config.get_string("certificate_authorities").expect("Could not find server's certificate authorities file in config");
+		let cafile = config.get_string("certificate_authorities")?;
 
 		let config = ConfigSettings {
 			user,
 			root,
-			default_host,
+			default_authority,
 			server_side_rendering_enabled,
 			port,
 			client_side_rendering_enabled,
@@ -74,11 +90,25 @@ impl ConfigSettings {
 			certificate_authorities_filename: cafile,
 		};
 
+		return Ok(config);
+	}
+
+	pub fn init(config_filename: &str) -> Result<&'static Self> {
+		let config = Self::read(config_filename)?;
+		CONFIG.set(config)?;
+		let config = unsafe { CONFIG.get().unwrap_unchecked() };
+		return Ok(config);
+	}
+
+	pub async fn get() -> Result<&'static Self> {
+		let config = CONFIG.get_or_try_init(|| async {
+			Self::read_async(CONFIG_PATH).await
+		}).await;
 		return config;
 	}
 
-	pub async fn get() -> &'static ConfigSettings {
-		CONFIG.get_or_init(|| async { task::block_in_place(|| ConfigSettings::read(CONFIG_FILE)) }).await
+	pub unsafe fn get_unchecked() -> &'static Self {
+		unsafe { CONFIG.get().unwrap_unchecked() }
 	}
 }
 
@@ -109,8 +139,8 @@ impl FutureDocument {
 			_ = handle.await?;
 		}
 
-		let mutex = Arc::into_inner(self.wip_document).unwrap();
-		let doc = mutex.into_inner();
+		let mutex = Arc::into_inner(self.wip_document).unwrap(); // Known to be safe
+		let doc = mutex.into_inner(); // Known to be safe
 		return Ok( Document { contents: doc.contents });
 	}
 }
@@ -390,16 +420,26 @@ impl Arg {
 
 async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 	// TODO: Connection should be reused when possible
-	let config = ConfigSettings::get().await;
+	let config = ConfigSettings::get().await?;
 	let uri_string = unsafe { args.get(0).unwrap_unchecked().into_inner_string() }; // Safe due to parsing guarantees
 	let uri: Uri = uri_string.parse()?;
 	info!("sarascript::get() -> {}", uri.to_string());
+	let config_authority: Uri = config.default_authority.parse()?;
+	let mut is_using_config_host = false;
 	let host = uri.host().unwrap_or_else(|| {
-		&config.default_host
+		is_using_config_host = true;
+		config_authority.host().unwrap() // TODO: Need to check config before getting to assert that it is okay
 	});
-	let port = match uri.port() {
-		Some(port) => port.as_u16(),
-		None => 443,
+
+	let port = match uri.port_u16() {
+		Some(port) => port,
+		None => {
+			if is_using_config_host && config_authority.port_u16().is_some() {
+				unsafe { config_authority.port_u16().unwrap_unchecked() }
+			} else {
+				443
+			}
+		},
 	};
 	let path_and_query = match uri.path_and_query() {
 		Some(path_and_query) => path_and_query.as_str(),
@@ -408,6 +448,8 @@ async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 
 	let use_tls = if port == 443 { true } else { false };
 	let stream = HyperStream::connect(host, port, use_tls).await?;
+
+	info!("Processing request: GET {host}:{port}{path_and_query}");
 
 	// Perform a TCP handshake
 	let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();

@@ -1,7 +1,15 @@
-use sarascript::server::launch_server;
+use sarascript::server::{launch_server, run_server};
+use std::env;
 
 fn main() {
 	println!("Starting!");
+	let args: Vec<String> = env::args().collect();
+	if let Some(flag) = args.get(1) {
+		if flag == "-d" {
+			run_server();
+		}
+	}
+
 	launch_server();
 }
 
