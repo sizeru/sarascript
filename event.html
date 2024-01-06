@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+	<body>
+		<h1>A random number should arrive here every second.</h1>
+		<script type="sarascript">event("/tests/rng", "<h2>{}</h2>", "Unable to get random number");</script>
+		<p>Syntax: <code>event(registration_url: string, on_event: string,
+		on-failure: string);</code><br/> In <b>sarascript</b>, an event will
+		periodically return an html snippet. This snippet will be formatted
+		according to the on_event string. If the event fails for any reason, the
+		on_failure string will instead be printed</p>
+	</body>
+</html>
