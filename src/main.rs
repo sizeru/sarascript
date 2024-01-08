@@ -1,16 +1,23 @@
 use sarascript::server::{launch_server, run_server};
-use std::env;
+use std::{env, process::ExitCode};
 
-fn main() {
-	println!("Starting!");
+fn main() -> Result<ExitCode, sarascript::error::SaraError> {
+	println!("Starting sarascript!");
 	let args: Vec<String> = env::args().collect();
-	if let Some(flag) = args.get(1) {
-		if flag == "-d" {
-			run_server();
-		}
-	}
+	let debug_flag = args.get(1).is_some_and(|flag| flag == "-d");
 
-	launch_server();
+	let exit_status = if debug_flag {
+		simplelog::WriteLogger::init(
+			simplelog::LevelFilter::Debug,
+			simplelog::Config::default(),
+			std::io::stdout()
+		).expect("Could not initialize logger");
+		run_server()
+	} else {
+		launch_server()
+	};
+
+	return exit_status;
 }
 
 // #[tokio::main]

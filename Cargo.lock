@@ -365,15 +365,18 @@ dependencies = [
 
 [[package]]
 name = "htmlprep"
-version = "0.1.0-alpha10"
+version = "0.1.0-alpha11"
 dependencies = [
  "anyhow",
+ "bytes",
  "config",
  "daemonize",
  "hickory-resolver",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
+ "libc",
  "log",
  "pest",
  "pest_derive",

@@ -10,12 +10,12 @@ use tokio::{
 	io::{AsyncRead, AsyncWrite},
 	net::TcpStream, task::block_in_place,
 };
-use crate::ConfigSettings;
+use crate::{ConfigSettings, error::SaraError};
 
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_rustls::rustls::{pki_types, ClientConfig, RootCertStore};
 
-type Result<T, E=std::io::Error> = std::result::Result<T, E>;
+type Result<T, E=crate::error::SaraError> = std::result::Result<T, E>;
 
 pub enum HyperStream {
 	Plain(TcpStream),
@@ -23,7 +23,7 @@ pub enum HyperStream {
 }
 
 impl Read for HyperStream {
-	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<Result<()>> {
+	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<Result<(), std::io::Error>> {
 		// Both TcpStream and TlsStream implement Unpin, which makes this easy.
 		// This causes rust to implement Deref in order to transparently access the inner value of the Pin
 		// They also implement tokio::io::AsyncRead, so our wrapper only needs to call to that.
@@ -47,21 +47,21 @@ impl Read for HyperStream {
 }
 
 impl Write for HyperStream {
-	fn poll_write( self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
+	fn poll_write( self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, std::io::Error>> {
 		match self.get_mut() {
 			HyperStream::Plain(ref mut stream) => Pin::new(stream).poll_write(cx, buf),
 			HyperStream::Tls(ref mut tls_stream) => Pin::new(tls_stream).poll_write(cx, buf),
 		}
 	}
 
-	fn poll_flush( self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+	fn poll_flush( self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
 		match self.get_mut() {
 			HyperStream::Plain(ref mut stream) => Pin::new(stream).poll_flush(cx),
 			HyperStream::Tls(ref mut tls_stream) => Pin::new(tls_stream).poll_flush(cx),
 		}
 	}
 
-	fn poll_shutdown( self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+	fn poll_shutdown( self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
 		match self.get_mut() {
 			HyperStream::Plain(ref mut stream) => Pin::new(stream).poll_shutdown(cx),
 			HyperStream::Tls(ref mut tls_stream) => Pin::new(tls_stream).poll_shutdown(cx),
@@ -73,14 +73,14 @@ impl Write for HyperStream {
 impl HyperStream {
 	pub async fn connect(domain: &str, port: u16, use_tls: bool) -> Result<Self> {
 		
-		let config = ConfigSettings::get().await;
+		let config = ConfigSettings::get().await?;
 		let resolver = block_in_place(|| async {
 			hickory_resolver::TokioAsyncResolver::tokio(
 				hickory_resolver::config::ResolverConfig::default(),
 				hickory_resolver::config::ResolverOpts::default()
 			)
 		}).await;
-		let response = resolver.lookup_ip(domain).await?;
+		let response = resolver.lookup_ip(domain).await.map_err(|resolve_error| SaraError::DnsResolution(resolve_error))?;
 		let address = response.iter().next().unwrap();
 		let stream = TcpStream::connect((address, port)).await?;
 

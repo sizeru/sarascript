@@ -1,6 +1,6 @@
 [package]
 name = "htmlprep"
-version = "0.1.0-alpha10"
+version = "0.1.0-alpha11"
 description = "IN-ALPHA: An HTML Pre-Processor for creating static HTML files"
 license = "MIT OR Apache-2.0"
 include = ["/src"]
@@ -25,6 +25,10 @@ log = { version = "0.4.20", optional = true }
 simplelog = { version = "0.12.1", optional = true }
 anyhow = { version = "1.0.78", optional = true }
 hickory-resolver = "0.24.0"
+http-body = "1.0.0"
+bytes = "1.5.0"
+
+libc = "0.2.151"
 
 [features]
 default = ["server"]

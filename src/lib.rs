@@ -1,12 +1,12 @@
-use std::{
+use core::{
 	str,
-	sync::Arc,
 	ops::Range,
 };
-use log::info;
+use std::sync::Arc;
+use log::debug;
 use tokio::{
 	sync::{Mutex, OnceCell},
-	task::{self, JoinHandle},
+	task::{self, JoinHandle, JoinError},
 	io::AsyncWriteExt,
 };
 use http::{Request, Uri};
@@ -20,7 +20,7 @@ pub mod hyper_tokio_adapter;
 use hyper_tokio_adapter::HyperStream;
 #[cfg(feature = "server")]
 pub mod server;
-mod error;
+pub mod error;
 use error::SaraError;
 
 type Result<T, E = SaraError> = std::result::Result<T, E>;
@@ -36,7 +36,7 @@ static CONFIG: OnceCell<ConfigSettings> = OnceCell::const_new();
 pub struct SaraParser;
 
 #[derive(Debug)]
-struct ConfigSettings {
+pub struct ConfigSettings {
 	user: String,
 	root: String,
 	default_authority: String,
@@ -63,7 +63,7 @@ impl ConfigSettings {
 			Config::builder()
 				.add_source(config::File::new(&config_filename_clone, FileFormat::Toml))
 				.build()
-		}).await??;
+		}).await.map_err(|join_error| SaraError::FailedToReadConfig(Box::new(join_error)))??;
 		return ConfigSettings::parse(config);
 	}
 
@@ -95,7 +95,7 @@ impl ConfigSettings {
 
 	pub fn init(config_filename: &str) -> Result<&'static Self> {
 		let config = Self::read(config_filename)?;
-		CONFIG.set(config)?;
+		CONFIG.set(config).map_err(|err| SaraError::FailedToSetConfig(err))?;
 		let config = unsafe { CONFIG.get().unwrap_unchecked() };
 		return Ok(config);
 	}
@@ -112,12 +112,19 @@ impl ConfigSettings {
 	}
 }
 
-
 pub struct Document {
-	pub contents: Vec<u8>
+	pub contents: Vec<u8>,
+	pub errors: Vec<JoinError>,
 }
 
-impl Document {}
+impl Document {
+	pub fn new(contents: Vec<u8>, errors: Option<Vec<JoinError>>) -> Self {
+		Self {
+			contents,
+			errors: errors.unwrap_or(Vec::new())
+		}
+	}
+}
 
 struct FutureDocument {
 	join_handles: Vec<JoinHandle<Result<()>>>,
@@ -134,27 +141,26 @@ impl FutureDocument {
 		}
 	}
 
-	async fn join_all(mut self) -> Result<Document> {
+	async fn join_all(mut self) -> Document {
+		let mut errors = Vec::new();
 		for handle in &mut self.join_handles {
-			_ = handle.await?;
+			if let Some(err) = handle.await.err() {
+				errors.push(err);
+			}
 		}
 
 		let mutex = Arc::into_inner(self.wip_document).unwrap(); // Known to be safe
 		let doc = mutex.into_inner(); // Known to be safe
-		return Ok( Document { contents: doc.contents });
-	}
-}
 
-pub async fn parse_file(filename: &str) -> Result<Document> {
-	let bytes = tokio::fs::read(filename).await?;
-	let document = parse_text(bytes)?.join_all().await?;
-	return Ok(document);
+		let errors = if errors.is_empty() { None } else { Some(errors) };
+		return Document::new(doc.contents, errors);
+	}
 }
 
 // Take ownership of the vec to be more effecient.
 fn parse_text(text: Vec<u8>) -> Result<FutureDocument> {
-	let original_text_string = std::str::from_utf8(&text)?;
-	let parsed_file = SaraParser::parse(Rule::file, original_text_string)?;
+	let original_text_string = std::str::from_utf8(&text).map_err(|err| SaraError::HtmlFileNotUtf8(err))?;
+	let parsed_file = SaraParser::parse(Rule::file, original_text_string).map_err(|err| SaraError::FailedParsingSarascript(err))?;
 
 	let wip_doc = Arc::new(Mutex::new(WipDocument::new(text.clone())));
 	let mut join_handles = Vec::new();
@@ -423,7 +429,6 @@ async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 	let config = ConfigSettings::get().await?;
 	let uri_string = unsafe { args.get(0).unwrap_unchecked().into_inner_string() }; // Safe due to parsing guarantees
 	let uri: Uri = uri_string.parse()?;
-	info!("sarascript::get() -> {}", uri.to_string());
 	let config_authority: Uri = config.default_authority.parse()?;
 	let mut is_using_config_host = false;
 	let host = uri.host().unwrap_or_else(|| {
@@ -449,7 +454,7 @@ async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 	let use_tls = if port == 443 { true } else { false };
 	let stream = HyperStream::connect(host, port, use_tls).await?;
 
-	info!("Processing request: GET {host}:{port}{path_and_query}");
+	debug!("Script instruction: GET {host}:{port}{path_and_query}");
 
 	// Perform a TCP handshake
 	let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
@@ -467,55 +472,20 @@ async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 		.uri(path_and_query)
 		.header(hyper::header::USER_AGENT, USER_AGENT)
 		.header(hyper::header::HOST, host)
-		// .header(hyper::header::CONNECTION, "close")
-		.body(Empty::<Bytes>::new())?;
+		.body(Empty::<Bytes>::new())
+		.map_err(|err| SaraError::FailedToBuildRequest(err))?;
 
 	// Await the response...
-	let mut response = sender.send_request(request).await?;
+	let mut response = sender.send_request(request).await.map_err(|err| SaraError::FailedToSendRequest(err))?;
 
 	let mut text = Vec::new();
 	while let Some(next) = response.frame().await {
-		let frame = next?;
+		let frame = next.map_err(|err| SaraError::FrameError(err))?;
 		if let Some(chunk) = frame.data_ref() {
 			text.reserve(chunk.len());
-			text.write(chunk).await?;
+			text.write(chunk).await.map_err(|err| SaraError::FailedToWriteToStream(err))?;
 		}
 	}
 
 	return Ok(text);
 }
-
-// async fn connect(host: &str, port: Option<u16>) -> 
-// Result<http1::SendRequest<Empty<Bytes>>> {
-// 	// Use an adapter to implement `hyper::rt` IO traits.
-// 	let port = port.unwrap_or(443);
-// 	let use_tls = if port == 443 { true } else { false };
-// 	let stream = task::block_in_place(move || {HyperStream::connect(host, port, use_tls)}).await?;
-
-// 	// Perform a TCP handshake
-// 	let (sender, conn) = hyper::client::conn::http1::handshake::<HyperStream, Empty<Bytes>>(stream).await.unwrap();
-
-// 	// Spawn a task to poll the connection, driving the HTTP state. Should this be async?
-// 	// Note: I feel like not awaiting this is a race condition.
-// 	task::spawn(async move {
-// 		if let Err(err) = conn.await {
-// 			println!("Connection failed: {:?}", err);
-// 		}
-// 	});
-
-// 	return Ok(sender);
-// }
-	
-// pub async fn get_single<'a, B: Body + 'static>(sender: Arc<Mutex<http1::SendRequest<B>>>, body: B, domain: String, path: String) -> Result<Response<Incoming>>{
-// 	let mut sender  = sender.lock().await;
-// 	let request = Request::builder()
-// 		.uri(path)
-// 		.header(hyper::header::USER_AGENT, USER_AGENT)
-// 		.header(hyper::header::HOST, &domain)
-// 		// .header(hyper::header::CONNECTION, "close")
-// 		.body(body)?;
-
-// 	// Await the response...
-// 	let response = sender.send_request(request).await?;
-// 	return Ok(response);
-// }
