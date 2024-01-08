@@ -39,9 +39,9 @@ pub struct SaraParser;
 pub struct ConfigSettings {
 	user: String,
 	root: String,
-	default_authority: String,
+	request_from: String,
+	bind_to: String,
 	server_side_rendering_enabled: bool,
-	port: u16,
 	client_side_rendering_enabled: bool,
 	log_filename: String,
 	pid_filename: String,
@@ -71,9 +71,9 @@ impl ConfigSettings {
 		let root = config.get_string("root")?;
 		let user = config.get_string("user")?;
 		let default_authority = config.get_string("default_authority")?;
+		let bind_address = config.get_string("bind")?;
 		let client_side_rendering_enabled = config.get_bool("client_side_rendering").unwrap_or(false);
 		let server_side_rendering_enabled = config.get_bool("server_side_rendering").unwrap_or(false);
-		let port = config.get_int("port")? as u16; 
 		let log_filename = config.get_string("log_filename").unwrap_or(LOG_FILE.to_string());
 		let pid_filename = config.get_string("pid_filename").unwrap_or(PID_FILE.to_string());
 		let cafile = config.get_string("certificate_authorities")?;
@@ -81,9 +81,9 @@ impl ConfigSettings {
 		let config = ConfigSettings {
 			user,
 			root,
-			default_authority,
+			request_from: default_authority,
+			bind_to: bind_address,
 			server_side_rendering_enabled,
-			port,
 			client_side_rendering_enabled,
 			log_filename,
 			pid_filename,
@@ -429,7 +429,7 @@ async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
 	let config = ConfigSettings::get().await?;
 	let uri_string = unsafe { args.get(0).unwrap_unchecked().into_inner_string() }; // Safe due to parsing guarantees
 	let uri: Uri = uri_string.parse()?;
-	let config_authority: Uri = config.default_authority.parse()?;
+	let config_authority: Uri = config.request_from.parse()?;
 	let mut is_using_config_host = false;
 	let host = uri.host().unwrap_or_else(|| {
 		is_using_config_host = true;

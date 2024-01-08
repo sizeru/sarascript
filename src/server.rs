@@ -21,7 +21,6 @@ use tokio::{ net::TcpListener, fs, io};
 use crate::{ hyper_tokio_adapter::HyperStream, parse_text, ConfigSettings, CONFIG_PATH, error::{SaraError, is_directory}, };
 
 type Result<T, E=SaraError> = std::result::Result<T, E>;
-const LOCALHOST: [u8; 4] = [127, 0, 0, 1];
 
 struct File {
 	contents: Vec<u8>,
@@ -143,11 +142,12 @@ fn create_daemon(config: &ConfigSettings) -> Daemonize<()> {
 
 #[tokio::main]
 async fn run() -> u8 {
-	info!("Starting server");
 	let config = unsafe { ConfigSettings::get_unchecked() };
-	let addr = SocketAddr::from((LOCALHOST, config.port)); // Always bind to local loopback.
+	let addr: SocketAddr = config.bind_to.parse().expect("bind address is not correct");
 	let listener = TcpListener::bind(addr).await.expect("Could not bind TCP Listener");
 	// TODO: Would a new struct which implements Tcp Listening be useful?
+
+	info!("Starting server on: {addr}");
 
 	loop {
 		let stream = match listener.accept().await {
@@ -196,13 +196,13 @@ async fn respond(request: Request<hyper::body::Incoming>) -> Result<Response<Htt
 async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response<HttpBody>> {
 	let config = unsafe { ConfigSettings::get_unchecked() };
 	let req_uri = req.uri();
-	let req_host = req_uri.host().unwrap_or(&config.default_authority);
+	let req_host = req_uri.host().unwrap_or(&config.request_from);
 	let req_path = req_uri.path();
 	let req_query = req_uri.query().unwrap_or("");
 	let req_method = req.method().to_owned();
 
 	debug!("Received request: {req_method} {req_uri} from User Agent {}", req.headers().get("user-agent").map_or("None", |header| header.to_str().unwrap_or("Corrupted")));
-	let server_host = config.default_authority.as_str();
+	let server_host = config.request_from.as_str();
 	match (req_method, req_host, req_path, req_query) {
 		(Method::GET, host, _, "") if host == server_host => {
 			let file = read_file_or_index(req_path).await?;
