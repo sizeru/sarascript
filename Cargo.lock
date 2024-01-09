@@ -364,30 +364,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "htmlprep"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "config",
- "daemonize",
- "hickory-resolver",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "libc",
- "log",
- "pest",
- "pest_derive",
- "rustls-pemfile",
- "simplelog",
- "tokio",
- "tokio-rustls",
- "webpki-roots",
-]
-
-[[package]]
 name = "http"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -906,6 +882,30 @@ name = "ryu"
 version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f98d2aa92eebf49b69786be48e4477826b256916e84a57ff2a4f21923b48eb4c"
+
+[[package]]
+name = "sarascript"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "config",
+ "daemonize",
+ "hickory-resolver",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "libc",
+ "log",
+ "pest",
+ "pest_derive",
+ "rustls-pemfile",
+ "simplelog",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+]
 
 [[package]]
 name = "scopeguard"
