@@ -1,370 +1,491 @@
-use std::{io, error, fmt, fs, str::{self, Utf8Error}, path::{PathBuf, Path}, sync::OnceLock, collections::HashMap}; 
-use regex::bytes::{Regex, RegexBuilder, Captures};
+use core::{
+	str,
+	ops::Range,
+};
+use std::sync::Arc;
+use log::debug;
+use tokio::{
+	sync::{Mutex, OnceCell},
+	task::{self, JoinHandle, JoinError},
+	io::AsyncWriteExt,
+};
+use http::{Request, Uri};
+use hyper::body::Bytes;
+use pest_derive::Parser;
+use pest::{Parser, iterators::Pair};
+use http_body_util::{Empty, BodyExt};
+use config::{Config, FileFormat};
 
-static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
-const INCLUDE_REGEX: &str = r##"<!--\s*?#include\s+"([^"]+)"\s*?-->"##;
-static RE_PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
-const PLACEHOLDER_REGEX: &str = r##"<!--\s*?#placeholder\s+"([^"]+)"\s*?-->"##;
+pub mod hyper_tokio_adapter;
+use hyper_tokio_adapter::HyperStream;
+#[cfg(feature = "server")]
+pub mod server;
+pub mod error;
+use error::SaraError;
 
-#[derive(Debug)]
-pub struct Error {
-    kind: ErrorType,
-    source: Option<Box<dyn error::Error>>,
-}
+type Result<T, E = SaraError> = std::result::Result<T, E>;
 
-#[derive(Debug)]
-enum ErrorType {
-    DirExists,
-    IO,
-    Utf8Parse,
-    SimLinkFound,
-    NoFilename,
-}
+const USER_AGENT: &str = concat!("sara/", env!("CARGO_PKG_VERSION"));
+const LOG_FILE: &str = "/var/log/sarascriptd/sarascriptd.log";
+const PID_FILE: &str = "/var/run/sarascriptd.pid";
+const CONFIG_PATH: &str = "/etc/sarascriptd.conf";
+static CONFIG: OnceCell<ConfigSettings> = OnceCell::const_new();
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Error type: {:?} caused by: {:?} ", self.kind, self.source)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Error{kind: ErrorType::IO, source: Some(Box::new(error))}
-    }
-}
-
-impl From<Utf8Error> for Error {
-    fn from(error: Utf8Error) -> Self {
-        Error{kind: ErrorType::Utf8Parse, source: Some(Box::new(error))}
-    }
-}
+#[derive(Parser)]
+#[grammar = "sarascript.pest"]
+pub struct SaraParser;
 
 #[derive(Debug)]
-pub struct Html {
-    bytes: Vec<u8>
+pub struct ConfigSettings {
+	user: String,
+	root: String,
+	request_from: String,
+	bind_to: String,
+	server_side_rendering_enabled: bool,
+	client_side_rendering_enabled: bool,
+	log_filename: String,
+	pid_filename: String,
+	certificate_authorities_filename: String,
 }
 
-impl From<Html> for Vec<u8> {
-    fn from(value: Html) -> Self {
-        return value.bytes;
-    }
+impl ConfigSettings {
+	// Read and parse a config from the filesystem. This should probably only ever be called once.
+	pub fn read(config_filename: &str) -> Result<ConfigSettings> {
+		let config = Config::builder()
+			.add_source(config::File::new(config_filename, FileFormat::Toml))
+			.build()?;
+		return ConfigSettings::parse(config);
+	}
+
+	pub async fn read_async(config_filename: &str) -> Result<ConfigSettings> {
+		let config_filename_clone = config_filename.to_owned();
+		let config = task::spawn_blocking(move || {
+			Config::builder()
+				.add_source(config::File::new(&config_filename_clone, FileFormat::Toml))
+				.build()
+		}).await.map_err(|join_error| SaraError::FailedToReadConfig(Box::new(join_error)))??;
+		return ConfigSettings::parse(config);
+	}
+
+	fn parse(config: Config) -> Result<ConfigSettings> {
+		let root = config.get_string("root")?;
+		let user = config.get_string("user")?;
+		let default_authority = config.get_string("default_authority")?;
+		let bind_address = config.get_string("bind")?;
+		let client_side_rendering_enabled = config.get_bool("client_side_rendering").unwrap_or(false);
+		let server_side_rendering_enabled = config.get_bool("server_side_rendering").unwrap_or(false);
+		let log_filename = config.get_string("log_filename").unwrap_or(LOG_FILE.to_string());
+		let pid_filename = config.get_string("pid_filename").unwrap_or(PID_FILE.to_string());
+		let cafile = config.get_string("certificate_authorities")?;
+
+		let config = ConfigSettings {
+			user,
+			root,
+			request_from: default_authority,
+			bind_to: bind_address,
+			server_side_rendering_enabled,
+			client_side_rendering_enabled,
+			log_filename,
+			pid_filename,
+			certificate_authorities_filename: cafile,
+		};
+
+		return Ok(config);
+	}
+
+	pub fn init(config_filename: &str) -> Result<&'static Self> {
+		let config = Self::read(config_filename)?;
+		CONFIG.set(config).map_err(|err| SaraError::FailedToSetConfig(err))?;
+		let config = unsafe { CONFIG.get().unwrap_unchecked() };
+		return Ok(config);
+	}
+
+	pub async fn get() -> Result<&'static Self> {
+		let config = CONFIG.get_or_try_init(|| async {
+			Self::read_async(CONFIG_PATH).await
+		}).await;
+		return config;
+	}
+
+	pub unsafe fn get_unchecked() -> &'static Self {
+		unsafe { CONFIG.get().unwrap_unchecked() }
+	}
 }
 
-impl From<Vec<u8>> for Html {
-    fn from(value: Vec<u8>) -> Self {
-        return Html { bytes: value };
-    }
+pub struct Document {
+	pub contents: Vec<u8>,
+	pub errors: Vec<JoinError>,
 }
 
-pub struct CompileOptions<'a> {
-    pub process_extensions: HashMap<String, String>,
-    pub skip_extensions: Vec<String>,
-    pub source: &'a Path,
-    pub dest: &'a Path,
-    pub root: &'a Path,
+impl Document {
+	pub fn new(contents: Vec<u8>, errors: Option<Vec<JoinError>>) -> Self {
+		Self {
+			contents,
+			errors: errors.unwrap_or(Vec::new())
+		}
+	}
 }
 
-impl Default for CompileOptions<'_> {
-    fn default() -> Self {
-        Self {
-            process_extensions: HashMap::from([
-                ("html".to_owned(), "html".to_owned()),
-                ("htmlraw".to_owned(), "html".to_owned()),
-            ]),
-            skip_extensions: vec![
-                String::from("htmlsnippet"),
-                String::from("htmlprep"),
-                String::from("")
-            ],
-            source: Path::new("."),
-            dest: Path::new("processed_html"),
-            root: Path::new("/"),
-        }
-    }
+struct FutureDocument {
+	join_handles: Vec<JoinHandle<Result<()>>>,
+	wip_document: Arc<Mutex<WipDocument>>,
+	_current_handle_index: usize, // Used when polling
 }
 
-impl CompileOptions<'_> {
-    pub fn compile(&self) -> Result<(), Error> 
-    {
-        // Do not allow dest dir to overwrite an existing file
-        match fs::metadata(self.dest) {
-            Err(error) => {
-                if error.kind().eq(&io::ErrorKind::NotFound) {
-                    fs::create_dir_all(self.dest)?;
-                }
-            },
-            Ok(dest_metadata) => {
-                if !dest_metadata.is_dir() {
-                    return Err(Error{kind: ErrorType::DirExists, source: None});
-                }
-            }
-        }
-        // Ensure that the root dir is a dir and actually exists
-        {
-            let root_metadata = fs::metadata(self.root)?;
-            if !root_metadata.is_dir() {
-                return Err(Error{kind: ErrorType::DirExists, source: None});
-            }
-        }
-        // All checkable options are valid. Begin processing.
-        let source_metadata = fs::metadata(self.source)?;
-        if source_metadata.is_dir() {
-            self.compile_dir(self.source, self.dest)?;
-        } else if source_metadata.is_file() {
-            let processed = process_file(self.source, self.root)?;
-            fs::write(
-                self.dest.join(self.source.file_name().unwrap()),
-                &processed
-            )?;
-        }
-        Ok(())
-    }
+impl FutureDocument {
+	fn new(wip_doc: Arc<Mutex<WipDocument>>, join_handles: Vec<JoinHandle<Result<()>>>) -> Self {
+		Self {
+			join_handles,
+			wip_document: wip_doc,
+			_current_handle_index: 0,
+		}
+	}
 
-    /// Recursively tries to process every file in a directory. Intentionally
-    /// left private.
-    fn compile_dir(&self, source: &Path, dest: &Path) -> Result<(), Error> {
-        let dir_entries = source.read_dir()?;
-        for entry in dir_entries {
-            let file = entry?;
-            let file_type = file.file_type()?;
-            let file_path = file.path();
-            let file_extension = match file_path.extension() {
-                Some(extension) => extension.to_str().unwrap().to_owned(),
-                None => String::from(""),
-            };
-            if self.skip_extensions.contains(&file_extension) {
-                continue;
-            }
-            let dest = dest.join(&file.file_name());
-            if file_type.is_dir() {
-                self.compile_dir(&file_path, &dest)?; 
-            } else if file_type.is_file() {
-                match self.process_extensions.get(&file_extension) {
-                    None => {
-                        fs::copy(&file_path, &dest)?;
-                    },
-                    Some(extension) => {
-                        let processed = process_file(&file.path(), self.root)?;
-                        fs::write(&dest.with_extension(extension), &processed)?;
-                    },
-                }
-            } else {
-                return Err(Error{ kind: ErrorType::SimLinkFound, source: None });
-            }
-        }
-        Ok(())
-    } 
+	async fn join_all(mut self) -> Document {
+		let mut errors = Vec::new();
+		for handle in &mut self.join_handles {
+			if let Some(err) = handle.await.err() {
+				errors.push(err);
+			}
+		}
 
+		let mutex = Arc::into_inner(self.wip_document).unwrap(); // Known to be safe
+		let doc = mutex.into_inner(); // Known to be safe
+
+		let errors = if errors.is_empty() { None } else { Some(errors) };
+		return Document::new(doc.contents, errors);
+	}
 }
 
-// TODO ASAP:
-// - Better tests
+// Take ownership of the vec to be more effecient.
+fn parse_text(text: Vec<u8>) -> Result<FutureDocument> {
+	let original_text_string = std::str::from_utf8(&text).map_err(|err| SaraError::HtmlFileNotUtf8(err))?;
+	let parsed_file = SaraParser::parse(Rule::file, original_text_string).map_err(|err| SaraError::FailedParsingSarascript(err))?;
 
-// TODO would be nice:
-// - It would be nice if there was a cmdline util
-// - It would be even nicer if you could specify a dir on a remote server to ssh
-//   into and copy all files over to in one fell swoop
-// - It would be nice if you could run it PHP style, with a dynamic server that
-//   processes all files as they come, but this should only be used for testing
-//   purposes, because the goal of this project is MAINLY for generating static
-//   content easier
+	let wip_doc = Arc::new(Mutex::new(WipDocument::new(text.clone())));
+	let mut join_handles = Vec::new();
 
-/// Processes a single file and returns a structure containing the entire file
-/// in memory
-pub fn process_file(file: &Path, webroot: &Path) -> Result<Vec<u8>, Error> {
-    if file.file_name().is_none() {
-        return Err(Error {kind: ErrorType::NoFilename, source: None });
-    }
+	for script in parsed_file {
+		let operations = parse_script(script);
+		for operation in operations {
+			join_handles.push(task::spawn( execute_operation(operation, wip_doc.clone())));
+		}
+	}
 
-    let raw_html = fs::read(file)?;
-    return Ok(Html::process(raw_html.as_slice(), webroot, unsafe{file.parent().unwrap_unchecked()} 
-        /* a file with a name is guaranteed to also have a parent */
-    )?.into());
+	let future_doc = FutureDocument::new(wip_doc, join_handles);
+	return Ok(future_doc);
 }
 
-impl Html {
-    /// Pre-processes a slice of bytes.
-    pub fn process(html: &[u8], website_root: &Path, cwd: &Path) -> Result<Self, Error> {
-        let re_include = RE_INCLUDE.get_or_init(|| RegexBuilder::new(INCLUDE_REGEX)
-            .dot_matches_new_line(true)
-            .build()
-            .unwrap()
-        );
-        let mut processed_html = html.to_vec();
-        let include_captures: Vec<Captures>  = re_include.captures_iter(&html).collect();
-        for capture in include_captures.iter().rev() {
-            let comment = unsafe{ capture.get(0).unwrap_unchecked() };
-            let comment_path = unsafe{ capture.get(1).unwrap_unchecked() };
-            let include_path = make_path_absolute(&comment_path.as_bytes(), website_root, cwd)?;
-            let include_contents = fs::read(include_path)?;
-            let comment_range = comment.start()..comment.end();
-            processed_html.splice(comment_range, include_contents);
-        }
-    
-        return Ok(processed_html.into());
-    }
+async fn execute_operation(operation: Operation, wip_document: Arc<Mutex<WipDocument>>) -> Result<()> {
+	match operation.opcode {
+		Opcode::GET => {
+			let resource = match get(operation.args).await {
+				Ok(resource) => resource,
+				Err(e) => format!("Could not load resource: {:?}", e.to_string()).as_bytes().to_vec(),
+			};
+			let mut doc = wip_document.lock().await;
+			doc.insert(resource, operation.span);
+		},
+		Opcode::TAG => {
+			let mut doc = wip_document.lock().await;
+			doc.remove(operation.span);
+		},
+		Opcode::ERR => unreachable!(),
+	};
+	return Ok(());
+}
 
-    /// Returns all `placeholders` in the file. A `placeholder` is a range in
-    /// the file which is meant to be replaced server-side each time the file is
-    /// requested. A `placeholder` is defined in an html file using a
-    /// `#placeholder` comment. This allows for arbitrary insertion of HTML at
-    /// runtime. The order of replacement does not matter.
-    /// 
-    /// # Examples
-    /// 
-    /// ```
-    /// use std::path::Path;
-    /// use std::str;
-    /// use htmlprep::*;
-    /// 
-    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let raw_html = r##"
-    ///             <!DOCTYPE html><html><body>
-    ///                 <!-- #placeholder "name" -->
-    ///                 <!-- #placeholder "visitor-number" -->
-    ///             </body></html>"##.as_bytes();
-    ///     
-    ///     let mut html: Html = raw_html.to_vec().into();
-    ///     let mut placeholders = html.get_placeholders()?;
-    ///     assert!(placeholders.contains("name"));
-    ///     assert!(placeholders.contains("visitor-number"));
-    ///     
-    ///     let name = "Alice";
-    ///     let name_replacement = format!("<p>Welcome to the site, <b>{name}!</b></p>");
-    ///     html.replace_placeholder(&mut placeholders, "name", name_replacement.as_bytes());
-    ///     let visitor_number = 1234;
-    ///     let visitor_num_replacement = format!("<p>You are visitor number: {visitor_number}</p>");
-    ///     html.replace_placeholder(&mut placeholders, "visitor-number", visitor_num_replacement.as_bytes());
-    ///     // Calling this function again is a no-op
-    ///     html.replace_placeholder(&mut placeholders, "visitor-number", visitor_num_replacement.as_bytes());
-    ///     
-    ///     let html_vec: Vec<u8> = html.into();
-    ///     let result = r##"
-    ///             <!DOCTYPE html><html><body>
-    ///                 <p>Welcome to the site, <b>Alice!</b></p>
-    ///                 <p>You are visitor number: 1234</p>
-    ///             </body></html>"##.as_bytes().to_vec();
-    ///     
-    ///     assert!(result.eq(&html_vec));
-    ///     return Ok(());
-    /// }
-    /// ```
-    pub fn get_placeholders(&self) -> Result<Placeholders, Error> {
-        let re_placeholder = RE_PLACEHOLDER.get_or_init(|| RegexBuilder::new(PLACEHOLDER_REGEX)
-            .dot_matches_new_line(true)
-            .build()
-            .unwrap()
-        );
+#[derive(Eq)]
+pub struct DocEdit {
+	original_index: usize,
+	edit_length: i64,
+}
 
-        let mut placeholders = Vec::new();
-        for capture in  re_placeholder.captures_iter(&self.bytes) {
-            let comment = unsafe{ capture.get(0).unwrap_unchecked() };
-            let placeholder_name = unsafe{ capture.get(1).unwrap_unchecked() };
-            let name = str::from_utf8(placeholder_name.as_bytes())?;
-            placeholders.push(
-                Placeholder {
-                    start: comment.start(),
-                    end: comment.end(),
-                    name: name.to_owned(),
-                }
-            )
-        }
-        
-        return Ok(placeholders.into());
-    }
+impl Ord for DocEdit {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		return self.original_index.cmp(&other.original_index);
+	}
+}
 
-    /// Replaces the `placeholder_name` placeholder in the calling Html struct
-    /// with `replacement`. Upon completion of this function, the replaced
-    /// Placeholder will be removed from `placeholders`. 
-    pub fn replace_placeholder(&mut self, placeholders: &mut Placeholders, placeholder_name: &str, replacement: &[u8]) {
-        // Placeholders are kept in sorted order so that only what's necessary to update can be updated 
-        if let Some(index) = placeholders.data.iter().position(|p| p.name.eq(placeholder_name)) {
-            let to_be_replaced = placeholders.data.remove(index);
-            let bytes_added: isize = replacement.len() as isize - (to_be_replaced.end - to_be_replaced.start) as isize;
-            for i in index..placeholders.data.len() {
-                let placeholder = placeholders.data.get_mut(i).unwrap();
-                placeholder.start = (placeholder.start as isize + bytes_added) as usize;
-                placeholder.end = (placeholder.end as isize + bytes_added) as usize;
-            }
-            self.bytes.splice(to_be_replaced.start..to_be_replaced.end, replacement.to_vec());
-        }
-    }
+impl PartialOrd for DocEdit {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		match self.original_index.partial_cmp(&other.original_index) {
+			Some(core::cmp::Ordering::Equal) => {}
+			ord => return ord,
+		}
+		self.edit_length.partial_cmp(&other.edit_length)
+	}
+}
+
+impl PartialEq for DocEdit {
+	fn eq(&self, other: &Self) -> bool {
+		return self.original_index == other.original_index;
+	}
+}
+
+pub struct WipDocument {
+	contents: Vec<u8>,
+	edits: Vec<DocEdit>, // This vector is sorted
+}
+
+impl WipDocument {
+	pub fn new(doc: Vec<u8>) -> Self {
+		WipDocument {
+			contents: doc,
+			edits: Vec::new(),
+		}	
+	}
+}
+
+impl WipDocument {
+	fn add_edit(&mut self, original_index: usize, edit_size: i64) {
+		let edit = DocEdit {original_index, edit_length: edit_size};
+		if let Err(insert_index) = self.edits.binary_search(&edit) {
+			self.edits.insert(insert_index, edit);
+			return;
+		}
+		unreachable!(); // If the Ok variant is reached, there is already an edit beginning from this exact index. This is impossible.
+	}
+
+	fn get_wip_index(&self, original_index: usize) -> usize {
+		// Binary search will return the first DocEdit on or after the index in the
+		// original document. By summing up all edits before this, we can calculate
+		// just how much the document has shifted.
+		let doc_index = match self.edits.binary_search(&DocEdit{original_index, edit_length:0}) {
+			Ok(index) => index,
+			Err(index) => index,
+		};
+		let edits = &self.edits[0..doc_index];
+		let mut sum = 0;
+		for edit in edits {
+			sum += edit.edit_length
+		}
+		return original_index.wrapping_add(sum as usize);
+	}
+
+	// Insert a resource into this document
+	// TODO: The as [integers] in this function have the potential for undefined behavior
+	pub fn insert(&mut self, resource: Vec<u8>, range: Range<usize>) { 
+		let wip_index = self.get_wip_index(range.start);
+		self.add_edit(range.start, resource.len() as i64 - range.len() as i64);
+		self.contents.splice(wip_index..wip_index+range.len(), resource);
+	}
+
+	pub fn remove(&mut self, range: Range<usize>) {
+		let wip_index = self.get_wip_index(range.start);
+		self.add_edit(range.start, range.start.wrapping_sub(range.end) as i64);
+		self.contents.drain(wip_index..wip_index+range.len());
+	}
+}
+
+struct Script {
+	operations: Vec<Operation>,
+	is_type_correct: bool,
+}
+
+impl Script {
+	// Returns whether the script is valid sarascript
+	fn is_okay(&self) -> bool {
+		if self.is_type_correct == false {
+			return false;
+		}
+
+		for operation in &self.operations {
+			match operation.opcode {
+				Opcode::TAG => continue, // Parsing will only allow two tag operations
+				Opcode::ERR => return false,
+				Opcode::GET => {
+					if operation.args.len() != 1 { // Could do more advanced checking here
+						return false;
+					}
+				}
+			}
+		}
+
+		return true;
+	}
+
+	// Returns a new uninitialized script. This should be initialized
+	fn uninit() -> Self {
+		Self {
+			operations: Vec::new(),
+			is_type_correct: false,
+		}
+	}
+}
+
+fn parse_script(script: Pair<'_, Rule>) -> Vec<Operation> {
+	let mut parsed_script = Script::uninit();
+	let operations = &mut parsed_script.operations;
+	
+	for rule in script.into_inner() {
+		match rule.as_rule() {
+			Rule::function => {
+				let span = rule.as_span().start()..rule.as_span().end();
+				let mut function_data = rule.into_inner();
+				let name = function_data.next().unwrap().as_str();
+				let opcode = match name {
+					"get" => Opcode::GET,
+					_ => Opcode::ERR,
+				};
+				let mut args = Vec::new();
+				for argument in function_data {
+					let data = argument.into_inner().next().unwrap();
+					let value = match data.as_rule() {
+						Rule::symbol => Arg::Symbol(data.as_str().to_owned()),
+						Rule::string => Arg::String(data.into_inner().next().unwrap().as_str().to_owned()),
+						Rule::number => Arg::Num(data.as_str().parse().unwrap()),
+						_ => unreachable!()
+					};
+					args.push(value);
+				}
+				operations.push(Operation { opcode, args, span });
+			},
+			Rule::script_opening_tag => {
+				let start = rule.as_span().start();
+				let end = rule.as_span().end();
+				let op = Operation {
+					opcode: Opcode::TAG,
+					args: Vec::new(),
+					span: start..end,
+				};
+				operations.push(op);
+
+				for attribute in rule.into_inner() {
+					let mut attribute_info = attribute.into_inner();
+					let name = attribute_info.next().unwrap().as_str(); // Guaranteed
+					let text = attribute_info.next().unwrap().into_inner().next().unwrap().as_str(); // Guaranteed
+					if name == "type" && text == "sarascript" {
+						parsed_script.is_type_correct = true;
+					}
+				}
+			},
+			Rule::script_closing_tag => {
+				let start = rule.as_span().start();
+				let end = rule.as_span().end();
+				let op = Operation {
+					opcode: Opcode::TAG,
+					args: Vec::new(),
+					span: start..end,
+				};
+				operations.push(op);
+			}
+			_ => unreachable!(),
+		}
+	}
+	
+	// We want to make sure the entire script is okay before beginning to dispatch
+	assert!(parsed_script.is_okay());
+	return parsed_script.operations;
 }
 
 #[derive(Debug)]
-pub struct Placeholders {
-    data: Vec<Placeholder>
+enum Opcode {
+	GET,
+	ERR,
+	TAG, // Used internally as an instruction which should delete the internet 'tag' marks from the script
 }
 
-impl Placeholders {
-    pub fn contains<T>(&self, value: &T) -> bool
-    where
-        T: ?Sized, 
-        Placeholder: PartialEq<T>,
-    {
-        self.data.iter().any(|val| val == value)
-    }
+#[derive(Debug)]
+struct Operation {
+	opcode: Opcode,
+	span: Range<usize>, // What text is this operation meant to replace
+	args: Vec<Arg>,
 }
 
-impl PartialEq<str> for Placeholder {
-    fn eq(&self, other: &str) -> bool {
-        self.name == other
-    }
+#[derive(Debug)]
+enum Arg {
+	String(String),
+	Num(i64),
+	Symbol(String),
 }
 
-impl From<Vec<Placeholder>> for Placeholders {
-    fn from(value: Vec<Placeholder>) -> Self {
-        Self { data: value }
-    }
+impl Arg {
+	// TODO: This could be more effecient, but would be a micro-optimization
+	unsafe fn into_inner_string(&self) -> String {
+		match self {
+			Arg::String(string) => string.clone(),
+			_ => unreachable!()
+		}
+	}
+
+	unsafe fn into_inner_num(&self) -> i64 {
+		match self {
+			Arg::Num(num) => num.clone(),
+			_ => unreachable!()
+		}
+	}
+
+	unsafe fn into_inner_symbol(&self) -> String {
+		match self {
+			Arg::Symbol(symbol) => symbol.clone(),
+			_ => unreachable!()
+		}
+	}
 }
 
-#[derive(Debug, PartialEq)]
-pub struct Placeholder {
-    start: usize,
-    end: usize,
-    name: String,
-}
+async fn get(args: Vec<Arg>) -> Result<Vec<u8>> {
+	// TODO: Connection should be reused when possible
+	let config = ConfigSettings::get().await?;
+	let uri_string = unsafe { args.get(0).unwrap_unchecked().into_inner_string() }; // Safe due to parsing guarantees
+	let uri: Uri = uri_string.parse()?;
+	let config_authority: Uri = config.request_from.parse()?;
+	let mut is_using_config_host = false;
+	let host = uri.host().unwrap_or_else(|| {
+		is_using_config_host = true;
+		config_authority.host().unwrap() // TODO: Need to check config before getting to assert that it is okay
+	});
 
+	let port = match uri.port_u16() {
+		Some(port) => port,
+		None => {
+			if is_using_config_host && config_authority.port_u16().is_some() {
+				unsafe { config_authority.port_u16().unwrap_unchecked() }
+			} else {
+				443
+			}
+		},
+	};
+	let path_and_query = match uri.path_and_query() {
+		Some(path_and_query) => path_and_query.as_str(),
+		None => "/"
+	};
 
+	let use_tls = if port == 443 { true } else { false };
+	let stream = HyperStream::connect(host, port, use_tls).await?;
 
-/// Processes all files in `source` and places the results into the dir in
-/// `dest`. `source` can be either a file or a directory, but `dest` must only
-/// be a directory. Processing means that all #include comments in the source
-/// html are replaced with the file specified in the comment. Processing will
-/// not replace #placeholder comments, as these are mean to be replaced
-/// dynamically each time the file is requested. 
-///
-/// # Examples
-///
-/// ```
-/// fn main() {
-///     htmlprep::compile("/var/www/staging", "/var/www/prod", "/");
-///     // All files in staging will be copied to prod
-/// }
-/// ```
-pub fn compile(source: &str, dest: &str, webroot: &str) -> Result<(), Error> 
-{
-    let mut options = CompileOptions::default();
-    options.source = Path::new(source);
-    options.dest = Path::new(dest);
-    options.root = Path::new(webroot);
-    return options.compile();
-}
+	debug!("Script instruction: GET {host}:{port}{path_and_query}");
 
-/// Web servers usually change their root dir before serving files. Thus, paths
-/// in html files are likely to be based on a different root, however, this
-/// library will probably be called by a user who has not changed their root.
-/// Thus, this function is necessary to change the root of any absolute paths in
-/// html files. 
-fn make_path_absolute(path_in_comment: &[u8], website_root: &Path, cwd: &Path) -> Result<Box<Path>, core::str::Utf8Error> {
-    let path_as_str = str::from_utf8(path_in_comment)?;
-    if path_as_str.starts_with('/') {
-        let x = Ok(website_root.join(PathBuf::from(&path_as_str[1..])).into_boxed_path());
-        return x;
-    } else {
-        let x = Ok(cwd.join(PathBuf::from(&path_as_str)).into_boxed_path());
-        return x;
-    }
+	// Perform a TCP handshake
+	let (mut sender, conn) = hyper::client::conn::http1::handshake(stream).await.unwrap();
+
+	// Spawn task to poll the connection, driving the Http state.
+	// This `conn` will only return when the connection is closed
+	// Note: I feel like not awaiting this is possible race condition.
+	task::spawn(async move {
+		if let Err(err) = conn.await {
+			println!("Connection failed: {:?}", err);
+		}
+	});
+
+	let request = Request::builder()
+		.uri(path_and_query)
+		.header(hyper::header::USER_AGENT, USER_AGENT)
+		.header(hyper::header::HOST, host)
+		.body(Empty::<Bytes>::new())
+		.map_err(|err| SaraError::FailedToBuildRequest(err))?;
+
+	// Await the response...
+	let mut response = sender.send_request(request).await.map_err(|err| SaraError::FailedToSendRequest(err))?;
+
+	let mut text = Vec::new();
+	while let Some(next) = response.frame().await {
+		let frame = next.map_err(|err| SaraError::FrameError(err))?;
+		if let Some(chunk) = frame.data_ref() {
+			text.reserve(chunk.len());
+			text.write(chunk).await.map_err(|err| SaraError::FailedToWriteToStream(err))?;
+		}
+	}
+
+	return Ok(text);
 }

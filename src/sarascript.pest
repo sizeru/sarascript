@@ -1,0 +1,37 @@
+html_style_comment = _{ "<!--" ~ (!("-->") ~ ANY)* ~ "-->" }
+// c_line_comment = _{ "//" ~ (!NEWLINE ~ ANY)* }
+// c_multiline_comment = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+WHITESPACE = _{ WHITE_SPACE }
+COMMENT = _{ html_style_comment }
+
+// Define data types: 
+symbol_char = _{ ASCII_ALPHA | "_" }
+symbol = @{ (symbol_char) ~ (ASCII_ALPHANUMERIC | symbol_char)* }
+
+// The atomicity of string_char is enforced because of the atomicity of its parent (`text`)
+string_char = _{
+    !("\"" | "\\") ~ ANY
+    | "\\" ~ ("\"" | "\\" | "/" | "b" | "f" | "n" | "r" | "t")
+    | "\\" ~ ("u" ~ ASCII_HEX_DIGIT{4})
+}
+text = @{ string_char* }
+string = ${ "\"" ~ text ~ "\"" }
+
+number = { NUMBER }
+
+// define function
+argument = { symbol | string | number } 
+arg_delimiter = _{ "," }
+arguments = _{ (argument ~ (arg_delimiter ~ argument)*)? }
+function = { symbol ~ "(" ~ arguments ~ ")" ~ ";" } 
+
+script_opening_tag = { "<script" ~ attributes ~ ">" }
+script_closing_tag = { "</script" ~ ">" }
+
+attribute = { symbol ~ "=" ~ string }
+attributes = _{ (attribute)* }
+
+script = { script_opening_tag ~ function* ~ script_closing_tag }
+
+file = _{ ((!script ~ ANY)* ~ script ~ (!script ~ ANY)*)* }
