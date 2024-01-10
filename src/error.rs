@@ -37,6 +37,7 @@ pub enum SaraError {
 	FailedToSendRequest(hyper::Error),
 	InvalidUri(http::uri::InvalidUri),
 	DnsResolution(hickory_resolver::error::ResolveError),
+	RequestedDirectory(String),
 }
 
 impl SaraError {
@@ -62,6 +63,7 @@ impl SaraError {
 			Self::FailedToSendRequest(_) => unreachable!(),
 			Self::InvalidUri(_) => Response::builder().status(StatusCode::BAD_REQUEST).header(header::CONTENT_TYPE, ContentType::Plain.as_str()).body("Invalid uri".into()),
 			Self::DnsResolution(_) => Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).header(header::CONTENT_TYPE, ContentType::Plain.as_str()).body("Failed to resolve DNS of host".into()),
+			Self::RequestedDirectory(path) => Response::builder().status(StatusCode::PERMANENT_REDIRECT).header(header::LOCATION, format!("{path}/")).body("".into()),
 		};
 		return response.unwrap();
 	}
@@ -97,6 +99,7 @@ impl Display for SaraError {
 			Self::FailedToSendRequest(source) => write!(f, "failed to send request: {source}"),
 			Self::InvalidUri(source) => write!(f, "invalid uri: {source}"),
 			Self::DnsResolution(source) => write!(f, "dns resolution failed: {source}"),
+			Self::RequestedDirectory(_) => write!(f, ""), /* This is not really an error, it is just a redirect */
 		}
 	}
 }

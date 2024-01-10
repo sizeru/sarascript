@@ -8,6 +8,7 @@
 
 ## Prepping for v1.0.0
 - [ ] Document all public functions and structs
+- [ ] cargo clippy
 - [ ] Run and post benchmarks
 - [ ] Get a Windows release running
 - [ ] Ensure no known bugs
@@ -20,3 +21,11 @@
 - **Fix CSS name mangling**: Sarascript permits the user to dynamically load html files, which will load CSS files. This can result in a nest of CSS which is all present in one singular file. **If and only if CSS writers are not mindful of this issue**, having conflicting css definitions can lead to unexpected results. I believe CSS preprocessors like SCSS have a solution to this issue. Perhaps this crate should provide a method to link with SCSS.
 - **Add markdown parsing**: HTML is a great language for designing a business page, something to recruit people. Markdown is the undisputed KING of blogging. I created this tool mainly with the goal of making blogging easier in mind. A user should put some markdown files in a folder and have the program do the rest. Hugo is great great for exactly this, although I would take a different approach that requires less explicit configuration and is a lot more hands-off and resembles the raw HTML+CSS+JS workflow. Regardless, this program needs to link with a markdown-to-HTML converter.
 - **Optimize:** The plan is to optimize this program after v1.0.0 is released. Stability first.
+- **Features:** Maybe networking should be an explicit feature. The simplest web server will host all files locally. Networking is really for distributed systems.
+- **Remove dependencies:** pest should probably be replaced with something in-house. Tokio maybe replaced with mio. These are all incredible libraries, but I'd like extreme control over memory usage. the httparse crate is excellent at this
+- **No std:** Make cross compiling to weird platforms easier.
+
+
+## Focus
+- v1 is focused on stability
+- next release is focused on optimization

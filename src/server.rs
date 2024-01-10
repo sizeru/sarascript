@@ -228,18 +228,18 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 }
 
 async fn read_file_or_index(path: &str) -> Result<File> {
-	// Check if a file named `path`` exists
-	match fs::read(path).await {
-		Ok(contents) => return Ok(File::new(contents, path)),
-		Err(err) => match err.kind() {
-			io::ErrorKind::NotFound => (),
-			io::ErrorKind::PermissionDenied => return Err(SaraError::FileInvalidPermissions(path.to_owned())),
-			_ => if !is_directory(&err) { return Err(SaraError::OtherIOError(err)) },
-		}
-	};
-
-	// Check if a file named `path`.html exists
 	if !path.ends_with("/") {
+		// Check if a file named `path`` exists
+		match fs::read(path).await {
+			Ok(contents) => return Ok(File::new(contents, path)),
+			Err(err) => match err.kind() {
+				io::ErrorKind::NotFound => (),
+				io::ErrorKind::PermissionDenied => return Err(SaraError::FileInvalidPermissions(path.to_owned())),
+				_ => if !is_directory(&err) { return Err(SaraError::OtherIOError(err)) },
+			}
+		};
+
+		// Check if a file named `path`.html exists
 		let html_path = format!("{path}.html");
 		match fs::read(&html_path).await {
 			Ok(contents) => return Ok(File::new(contents, &html_path)),
@@ -249,15 +249,22 @@ async fn read_file_or_index(path: &str) -> Result<File> {
 				_ => if !is_directory(&err) { return Err(SaraError::OtherIOError(err)) },
 			}
 		}
-	}
-	// Check if either `path`/index.html or `path`index.html exists
-	let index_path = if path.ends_with("/") { format!("{path}index.html") } else { format!("{path}/index.html") };
-	match fs::read(&index_path).await {
-		Ok(contents) => return Ok(File::new(contents, &index_path)),
-		Err(err) => match err.kind() {
-			io::ErrorKind::NotFound => return Err(SaraError::FileNotFound(path.to_owned())),
-			io::ErrorKind::PermissionDenied => return Err(SaraError::FileInvalidPermissions(path.to_owned())),
-			_ => return Err(SaraError::OtherIOError(err)),
+
+		let index_path = format!("{path}/index.html");
+		match fs::metadata(index_path).await { /* Just checking to see if file exists */
+			Ok(_) => return Err(SaraError::RequestedDirectory(path.to_owned())),
+			Err(_) => return Err(SaraError::FileNotFound(path.to_owned())),
+		}
+
+	} else {
+		let index_path = format!("{path}index.html");
+		match fs::read(&index_path).await {
+			Ok(contents) => return Ok(File::new(contents, &index_path)),
+			Err(err) => match err.kind() {
+				io::ErrorKind::NotFound => return Err(SaraError::FileNotFound(path.to_owned())),
+				io::ErrorKind::PermissionDenied => return Err(SaraError::FileInvalidPermissions(path.to_owned())),
+				_ => return Err(SaraError::OtherIOError(err)),
+			}
 		}
 	}
 }
