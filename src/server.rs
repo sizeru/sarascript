@@ -207,12 +207,19 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 		(Method::GET, host, _, "") if host == server_host => {
 			let file = read_file_or_index(req_path).await?;
 			if !file.may_contain_scripts() {
-				Response::builder().header(header::CONTENT_TYPE, file.content_type.as_str()).body(file.contents.into()).map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
+				Response::builder()
+					.header(header::CONTENT_TYPE, file.content_type.as_str())
+					// TODO: Should include date modified as a header here, to encourage caching.
+					.body(file.contents.into())
+					.map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
 			} else {
 				if config.server_side_rendering_enabled {
 					let future_doc = parse_text(file.contents)?;
 					let document = future_doc.join_all().await;
-					Ok(Response::new(document.contents.into()))
+					Response::builder()
+						.header(header::CACHE_CONTROL, "max-age=86400") /* NOTE: Sarascript does not current support dynamic dispatch, so I can get away jith manually setting cache ages for now */
+						.body(document.contents.into())
+						.map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
 				} else {
 					todo!("Client side parsing is not implemented yet")
 				}

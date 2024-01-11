@@ -5,6 +5,9 @@
 - [ ] Create STANDALONE version by providing a command line interface. This can come later
 - [ ] Create CLIENT version somehow??? (I'm thinking WASM)
 - [ ] Allow deployment as single-page-application. (This allows a page to look and run like a native app on iOS). Maybe this can be done through a config flag. (You could theoretically have some code which only updates what changes, since browser caching doesn't work in this case).
+- [ ] Add the function: `preprocess_from_template(template_path);` (working title), and also syntax for defining a template. Will allow less repetition for html files.
+- [ ] Add the date modified when sending static files to encourage browser caching.
+- [ ] Determine whether a sarascript file is dynamic or not, and cache it appropriately.
 
 ## Prepping for v1.0.0
 - [ ] Document all public functions and structs
@@ -24,6 +27,7 @@
 - **Features:** Maybe networking should be an explicit feature. The simplest web server will host all files locally. Networking is really for distributed systems.
 - **Remove dependencies:** pest should probably be replaced with something in-house. Tokio maybe replaced with mio. These are all incredible libraries, but I'd like extreme control over memory usage. the httparse crate is excellent at this
 - **No std:** Make cross compiling to weird platforms easier.
+- **Do I need to parse the DOM?** Maybe... when you get into more complex functions such as templates, can a find and replace really suffice? I feel like since elements could be added in arbitrary places, and I still want to maintain the FEEL of writing pure html, I have to go beyond just a find-and-replace algorithm
 
 
 ## Focus
