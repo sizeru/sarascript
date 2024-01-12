@@ -210,6 +210,7 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 				Response::builder()
 					.header(header::CONTENT_TYPE, file.content_type.as_str())
 					// TODO: Should include date modified as a header here, to encourage caching.
+					.header(header::CACHE_CONTROL, "max-age=86400")  // NOTE(Nate): Just hardcode everything as cachable because I know it is right now.
 					.body(file.contents.into())
 					.map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
 			} else {
