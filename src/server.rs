@@ -170,7 +170,7 @@ async fn run() -> u8 {
 					service_fn(move |request| respond(request))
 				).await
 			{
-				error!("Unable to serve connection: {err}");
+				error!("Unable to parse the stream as an HTTP request. This can occur when trying to parse a non-HTTP stream: {err}");
 			}
 		});
 	}
