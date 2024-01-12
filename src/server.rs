@@ -202,9 +202,9 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 	let req_method = req.method().to_owned();
 
 	debug!("Received request: {req_method} {req_uri} from User Agent {}", req.headers().get("user-agent").map_or("None", |header| header.to_str().unwrap_or("Corrupted")));
-	let server_host = config.request_from.as_str();
+	// let server_host = config.request_from.as_str();
 	match (req_method, req_host, req_path, req_query) {
-		(Method::GET, host, _, _) if host == server_host => {
+		(Method::GET, _host, _, _) /* if host == server_host */ => {
 			let file = read_file_or_index(req_path).await?;
 			if !file.may_contain_scripts() {
 				Response::builder()
@@ -228,7 +228,7 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 				}
 			}
 		},
-		(Method::HEAD, host, _, _) if host == server_host => {
+		(Method::HEAD, _host, _, _) /* if host == server_host */ => {
 			let file = read_file_or_index(req_path).await?;
 			if !file.may_contain_scripts() {
 				Response::builder()
@@ -254,12 +254,12 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 				}
 			}
 		}
-		(other_method, host, _, _) if host == server_host => {
+		(other_method, _host, _, _) /* if host == server_host */ => {
 			Err(SaraError::HttpMethodUnsuported(other_method))
 		}
-		(_, other_host, _, _) => {
-			Err(SaraError::HttpHostInvalid(other_host.to_owned()))
-		},
+		// (_, other_host, _, _) => {
+		// 	Err(SaraError::HttpHostInvalid(other_host.to_owned()))
+		// },
 	}
 }
 
