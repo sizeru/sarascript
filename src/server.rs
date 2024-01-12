@@ -15,7 +15,7 @@ use std::{
 	process::ExitCode
 };
 use bytes::Bytes;
-use http::{Method, Request, Response, header};
+use http::{Method, Request, Response, header, StatusCode};
 use http_body::{Body, Frame, SizeHint};
 use tokio::{ net::TcpListener, fs, io};
 use crate::{ hyper_tokio_adapter::HyperStream, parse_text, ConfigSettings, CONFIG_PATH, error::{SaraError, is_directory}, };
@@ -204,10 +204,11 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 	debug!("Received request: {req_method} {req_uri} from User Agent {}", req.headers().get("user-agent").map_or("None", |header| header.to_str().unwrap_or("Corrupted")));
 	let server_host = config.request_from.as_str();
 	match (req_method, req_host, req_path, req_query) {
-		(Method::GET, host, _, "") if host == server_host => {
+		(Method::GET, host, _, _) if host == server_host => {
 			let file = read_file_or_index(req_path).await?;
 			if !file.may_contain_scripts() {
 				Response::builder()
+					.status(StatusCode::OK)
 					.header(header::CONTENT_TYPE, file.content_type.as_str())
 					// TODO: Should include date modified as a header here, to encourage caching.
 					.header(header::CACHE_CONTROL, "max-age=86400")  // NOTE(Nate): Just hardcode everything as cachable because I know it is right now.
@@ -218,6 +219,7 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 					let future_doc = parse_text(file.contents)?;
 					let document = future_doc.join_all().await;
 					Response::builder()
+						.status(StatusCode::OK)
 						.header(header::CACHE_CONTROL, "max-age=86400") /* NOTE: Sarascript does not current support dynamic dispatch, so I can get away jith manually setting cache ages for now */
 						.body(document.contents.into())
 						.map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
@@ -226,6 +228,32 @@ async fn handle_request(req: &Request<hyper::body::Incoming>) -> Result<Response
 				}
 			}
 		},
+		(Method::HEAD, host, _, _) if host == server_host => {
+			let file = read_file_or_index(req_path).await?;
+			if !file.may_contain_scripts() {
+				Response::builder()
+					.status(StatusCode::OK)
+					.header(header::CONTENT_TYPE, file.content_type.as_str())
+					.header(header::CONTENT_LENGTH, file.contents.len())
+					// TODO: Should include date modified as a header here, to encourage caching.
+					.header(header::CACHE_CONTROL, "max-age=86400")  // NOTE(Nate): Just hardcode everything as cachable because I know it is right now.
+					.body("".into())
+					.map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
+			} else {
+				if config.server_side_rendering_enabled {
+					let future_doc = parse_text(file.contents)?;
+					let document = future_doc.join_all().await;
+					Response::builder()
+						.status(StatusCode::OK)
+						.header(header::CONTENT_LENGTH, document.contents.len())
+						.header(header::CACHE_CONTROL, "max-age=86400") /* NOTE: Sarascript does not current support dynamic dispatch, so I can get away jith manually setting cache ages for now */
+						.body("".into())
+						.map_err(|http_error| SaraError::FailedToBuildResponse(http_error))
+				} else {
+					todo!("Client side parsing is not implemented yet")
+				}
+			}
+		}
 		(other_method, host, _, _) if host == server_host => {
 			Err(SaraError::HttpMethodUnsuported(other_method))
 		}
